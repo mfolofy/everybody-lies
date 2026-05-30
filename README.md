@@ -200,6 +200,8 @@ export GEMINI_API_KEY="..."               # Free tier available
 export OPENROUTER_API_KEY="sk-or-..."     # Universal fallback
 ```
 
+These are just the pre-configured providers. Any OpenAI-compatible endpoint works — Ollama, Azure, LiteLLM, your own server. See [Provider Support](#provider-support) for custom endpoints.
+
 The tool detects whichever keys you've set and picks the best available model. Set one. Set all. It figures it out.
 
 **No API keys?** Run with `--onboard` and House will walk you through setup. Or test with `--dry-run` to see what would happen without spending a cent.
@@ -253,7 +255,9 @@ All review reports are archived to `~/.everybody-lies/reviews/`. Permanent audit
 
 ## Provider Support
 
-House routes to whatever LLM providers you have. Set any API key — House detects it and uses the best available model.
+House is **provider-agnostic.** Any model, any API, any endpoint. The tool ships with sensible defaults for common providers, but you are not tied to them. Point House at whatever serves your models.
+
+**Built-in provider configurations** (zero setup — just set the env var):
 
 | Provider | Example models | Auth |
 |----------|---------------|------|
@@ -262,16 +266,27 @@ House routes to whatever LLM providers you have. Set any API key — House detec
 | **Gemini Direct** | gemini-2.5-flash, gemini-2.5-pro, gemini-3.5-flash | `GEMINI_API_KEY` |
 | **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek, …) | `OPENROUTER_API_KEY` |
 
-Direct APIs are faster and cheaper. OpenRouter is the universal fallback — any model, any provider. House tries direct first for models he knows, falls back to OpenRouter automatically.
+These are just the pre-configured ones. House tries direct APIs first (faster, cheaper), falls back to OpenRouter automatically (any model under the sun).
 
-**This is not tied to specific providers.** The provider registry in `everybody_lies/providers.py` is a few lines of configuration. Any OpenAI-compatible endpoint works — point it at a local Ollama instance, an Azure deployment, a LiteLLM proxy, or your own model server. House doesn't care who serves the model. He only cares what the model finds.
+**Any OpenAI-compatible endpoint works.** Local Ollama. Azure. LiteLLM proxy. Your own model server. A cloud GPU you SSH into. House doesn't care who serves the model — he only cares what the model finds.
 
-```python
-# Add a custom provider in ~/.everybody-lies/providers.json or via env:
-# Any OpenAI-compatible chat/completions endpoint works.
+```bash
+# Ollama running locally
 export EVERYBODY_LIES_CUSTOM_BASE_URL="http://localhost:11434/v1"
 export EVERYBODY_LIES_CUSTOM_API_KEY="ollama"
+
+# Azure OpenAI deployment
+export EVERYBODY_LIES_CUSTOM_BASE_URL="https://your-resource.openai.azure.com/openai/deployments/gpt-4o"
+export EVERYBODY_LIES_CUSTOM_API_KEY="your-azure-key"
+
+# LiteLLM proxy aggregating multiple providers
+export EVERYBODY_LIES_CUSTOM_BASE_URL="http://localhost:4000/v1"
+export EVERYBODY_LIES_CUSTOM_API_KEY="sk-litellm-..."
 ```
+
+The provider registry lives in `everybody_lies/providers.py`. It's ~50 lines of configuration. Add yours. Submit a PR if it's broadly useful.
+
+**Auto-detection** means you can set multiple keys and House picks the best model available. Claude Code users get Anthropic direct by default. CI pipelines might use DeepSeek for cost. Teammates might use OpenRouter. Same tool. Different keys. Same verdict.
 
 If all providers fail, House tells you exactly why — and it's probably your fault.
 
