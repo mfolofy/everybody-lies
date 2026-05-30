@@ -52,16 +52,15 @@ Most code review tools use one AI with a generic prompt. That's like diagnosing 
 
 Cuddy + five specialists who hate your code > one model who barely read it.
 
-## Integration — Ghost Stack Multi-Agent Fleet
+## Integration — Multi-Agent Workflows
 
-House is not a standalone tool. He is the **code review gatekeeper** in the [Ghost Stack](https://github.com/mfolofy/AI_Code) multi-agent fleet — a production system where seven AI agents collaborate across four machines.
+House is designed to run anywhere in your development workflow — as a CLI, a pre-commit hook, a CI step, or a Claude Code skill. Each reviewer is an independent AI call with its own context. They don't talk to each other. They report to House.
 
 **Chain of command:**
 
 ```
-Miguel (Human)
-    └── Orchestrator (Trinity / Mike)
-            ├── Executor (Thor / DeepSeek Pro) — writes the code
+You (Human)
+    └── Your AI coding agent — writes the code
             ├── HOUSE (GATEKEEPER) ← YOU ARE HERE
             │     ├── Dr. Cuddy — Differential diagnosis (approach validation)
             │     ├── Dr. Foreman — Backend / Infrastructure / Architecture
@@ -69,20 +68,32 @@ Miguel (Human)
             │     ├── Dr. Chase — Automation / DevOps / Security
             │     ├── Dr. Taub — Data / API / Integration
             │     └── Dr. Thirteen — QA / Edge Cases / Performance
-            └── Deployer (Mike) — deploys AFTER House approval
+            └── Deploy — only AFTER House approval
 ```
 
-**How agents invoke House:**
+**Ways to invoke House:**
 
-- **Trinity** (primary orchestrator): runs `everybody-lies --staged --tier standard` before every commit
-- **Thor** (executor): generates code → House reviews it → Thor fixes findings → House re-reviews
-- **Mike** (orchestrator): invokes House as a Claude Code skill: `/house --tier adversarial`
-- **Samuel** (Hermes on Tiger): triggers House via SSH for fleet learning code reviews
-- **Pre-commit hook**: installed in every Ghost Stack repo — no code reaches `main` without House's signature
+```bash
+# Standalone CLI — any terminal, any machine
+everybody-lies --staged --tier standard
 
-Each agent uses their own API keys. The tool auto-detects whatever is available. Trinity uses DeepSeek direct. Mike uses Anthropic direct. Samuel falls back to OpenRouter. House doesn't care who writes the check — he only cares that the code is right.
+# Pre-commit hook — blocks commits without House's signature
+# .git/hooks/pre-commit
+everybody-lies --staged --tier fast
 
-**This is a real system.** The review board of six AI specialists reviews real commits across a multi-repo monorepo daily. The ITIL audit trail in `~/.everybody-lies/reviews/` is the permanent record. The problem management engine detects recurring issues across reviews and files ITIL Problem Records. The dismissal learning engine suppresses noise over time.
+# CI/CD pipeline — GitHub Actions, GitLab CI, anything
+everybody-lies --diff "$(git diff origin/main...HEAD)" --ci github-actions
+
+# Claude Code skill — /house from your coding agent
+/house --tier adversarial
+
+# With an AI coding agent loop — generate → review → fix → re-review
+your-agent writes code → everybody-lies reviews it → agent fixes findings → re-review
+```
+
+Each call is stateless. House reads the diff, dispatches the review board, issues a verdict. Your agent, your CI pipeline, or your pre-commit hook decides what to do with it. House just tells you what's wrong.
+
+**Auto-detection works across environments.** Your laptop might have `ANTHROPIC_API_KEY` (Claude Code). Your CI runner might have `DEEPSEEK_API_KEY` (cheaper). Your teammate might use `OPENROUTER_API_KEY`. House detects whatever is available and uses the best model for each reviewer. Same tool. Different keys. Same verdict.
 
 ## Tiers
 
