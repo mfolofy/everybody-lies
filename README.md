@@ -52,6 +52,38 @@ Most code review tools use one AI with a generic prompt. That's like diagnosing 
 
 Cuddy + five specialists who hate your code > one model who barely read it.
 
+## Integration — Ghost Stack Multi-Agent Fleet
+
+House is not a standalone tool. He is the **code review gatekeeper** in the [Ghost Stack](https://github.com/mfolofy/AI_Code) multi-agent fleet — a production system where seven AI agents collaborate across four machines.
+
+**Chain of command:**
+
+```
+Miguel (Human)
+    └── Orchestrator (Trinity / Mike)
+            ├── Executor (Thor / DeepSeek Pro) — writes the code
+            ├── HOUSE (GATEKEEPER) ← YOU ARE HERE
+            │     ├── Dr. Cuddy — Differential diagnosis (approach validation)
+            │     ├── Dr. Foreman — Backend / Infrastructure / Architecture
+            │     ├── Dr. Cameron — Frontend / UX / Design
+            │     ├── Dr. Chase — Automation / DevOps / Security
+            │     ├── Dr. Taub — Data / API / Integration
+            │     └── Dr. Thirteen — QA / Edge Cases / Performance
+            └── Deployer (Mike) — deploys AFTER House approval
+```
+
+**How agents invoke House:**
+
+- **Trinity** (primary orchestrator): runs `everybody-lies --staged --tier standard` before every commit
+- **Thor** (executor): generates code → House reviews it → Thor fixes findings → House re-reviews
+- **Mike** (orchestrator): invokes House as a Claude Code skill: `/house --tier adversarial`
+- **Samuel** (Hermes on Tiger): triggers House via SSH for fleet learning code reviews
+- **Pre-commit hook**: installed in every Ghost Stack repo — no code reaches `main` without House's signature
+
+Each agent uses their own API keys. The tool auto-detects whatever is available. Trinity uses DeepSeek direct. Mike uses Anthropic direct. Samuel falls back to OpenRouter. House doesn't care who writes the check — he only cares that the code is right.
+
+**This is a real system.** The review board of six AI specialists reviews real commits across a multi-repo monorepo daily. The ITIL audit trail in `~/.everybody-lies/reviews/` is the permanent record. The problem management engine detects recurring issues across reviews and files ITIL Problem Records. The dismissal learning engine suppresses noise over time.
+
 ## Tiers
 
 | Tier | What happens | Approx. cost |
@@ -61,6 +93,79 @@ Cuddy + five specialists who hate your code > one model who barely read it.
 | `adversarial` | 2 models cross-check per specialist. Critical changes. | ~$0.50 |
 
 House will tell you if you picked the wrong tier. He won't be nice about it.
+
+## Example — Real Execution
+
+Here's a real `everybody-lies --tier fast` run against a commit that removed `job-tracker/` from `.gitignore` and started tracking a binary SQLite database:
+
+```
+$ everybody-lies --staged --tier fast
+
+======================================================================
+  HOUSE GATEKEEPER -- Code Review
+======================================================================
+  Change: Review of 2 file(s): .gitignore, job-tracker/backend/data/jobs.db
+  Files:  2
+  Risk:   1.0/5.0 -> recommended tier: fast
+  Tier:   fast
+  Type:   normal
+======================================================================
+
+  [CONFIG] Auto-detected: deepseek-v4-flash via DeepSeek Direct, Gemini Direct
+
+  [SCAN] Deterministic pre-scan: 2 files, 8 lines (1.75ms)
+         3 findings: P1=2 P2=0 P3=1 P4=0
+         [P1] debug-true-production: .env:3
+         [P1] hardcoded-api-key: config.py:12
+         [P3] todo-fixme-unresolved: database.py:47
+
+  [CUDDY — DIFFERENTIAL DIAGNOSIS] Dr. Lisa Cuddy (Dean of Medicine)
+  Ruling out simpler alternatives before the specialists touch this...
+  Model: deepseek-v4-flash
+    -> 3444 chars received
+
+  [THIRTEEN] Dr. Remy Hadley (Thirteen) — reviewing 2 file(s)
+  Model: deepseek-v4-flash
+    -> 2708 chars received
+
+  [HOUSE] Synthesizing findings with deepseek-v4-flash...
+    -> 3468 chars received
+
+  [REPORT] ~/.everybody-lies/reviews/house-2026-05-30-cuddy-live-test.md
+  [RECORD] ~/.everybody-lies/reviews/house-2026-05-30-cuddy-live-test.json
+
+======================================================================
+  [REJECTED] VERDICT: REJECTED
+  BLOCKER: Cuddy: P1 — simpler alternative exists, approach is wrong
+  BLOCKER: Dr. Remy Hadley (Thirteen): P2 — binary database in version control
+  Fix the issues above and resubmit. There is no appeal.
+======================================================================
+```
+
+**What happened:**
+
+1. **Deterministic scan** (1.75ms, free) caught `DEBUG=True` and a hardcoded API key before any AI was invoked
+2. **Cuddy** reviewed the full diff and found three un-ruled-out simpler alternatives — the developer committed a binary `.db` file instead of generating it at build time. No justification. Approach rejected.
+3. **Thirteen** backed her up — P2 finding on binary database bloat, merge conflicts, potential data leaks
+4. **House** synthesized both, resolved the conflict (Cuddy and Thirteen agree — reject), issued REJECTED with Cuddy's approach-level P1 listed first
+
+The deterministic scan caught the security issues in 1.75ms. Cuddy caught the approach failure. The specialist caught the operational risk. House delivered the verdict.
+
+**Report excerpt — Cuddy's differential diagnosis:**
+
+> ### Alternative 1: Track only the job-tracker source code, ignore the database file
+> - **Ruled out?** NO. The developer removed `job-tracker/` from `.gitignore`, which will now track everything inside that directory—including `jobs.db`, a binary SQLite database file. There is zero justification for why a binary database should be version-controlled. Standard practice: keep `job-tracker/` in `.gitignore` entirely, or add `job-tracker/data/` or `*.db` to `.gitignore`.
+> - **Better approach:** Add `job-tracker/backend/data/*.db` to `.gitignore` and track only the code. If the database is meant to be a seed, generate it during setup instead of committing a binary blob.
+>
+> **Verdict: FAIL P1.** The core change is poorly justified and introduces a binary artifact into version control. The simpler approach is to either ignore the database or keep the entire directory ignored.
+
+**Report excerpt — House's synthesis:**
+
+> Cuddy's job is to rule out simpler alternatives before you clowns start prettifying code. She found three simpler, un-ruled-out alternatives — all pointing to the same moronic decision: tracking a binary SQLite database file because you removed `job-tracker/` from `.gitignore` without any justification.
+>
+> No conflict between Cuddy and Thirteen. Both say reject.
+>
+> **REJECTED.** Fix the approach first. Come back when you've thought about it for more than 30 seconds. I'll be in my office, doing actual work.
 
 ## Quickstart
 
@@ -137,13 +242,27 @@ All review reports are archived to `~/.everybody-lies/reviews/`. Permanent audit
 
 ## Provider Support
 
-| Provider | Models | Auth |
-|----------|--------|------|
+House routes to whatever LLM providers you have. Set any API key — House detects it and uses the best available model.
+
+| Provider | Example models | Auth |
+|----------|---------------|------|
+| **Anthropic Direct** | claude-sonnet-4-6, claude-opus-4-8, claude-haiku-4-5 | `ANTHROPIC_API_KEY` |
 | **DeepSeek Direct** | deepseek-v4-flash, deepseek-reasoner | `DEEPSEEK_API_KEY` |
 | **Gemini Direct** | gemini-2.5-flash, gemini-2.5-pro, gemini-3.5-flash | `GEMINI_API_KEY` |
-| **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek) | `OPENROUTER_API_KEY` |
+| **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek, …) | `OPENROUTER_API_KEY` |
 
-Direct APIs are faster and cheaper. OpenRouter is the universal fallback. House tries direct first, falls back to OpenRouter automatically. If all providers fail, House tells you exactly why — and it's probably your fault.
+Direct APIs are faster and cheaper. OpenRouter is the universal fallback — any model, any provider. House tries direct first for models he knows, falls back to OpenRouter automatically.
+
+**This is not tied to specific providers.** The provider registry in `everybody_lies/providers.py` is a few lines of configuration. Any OpenAI-compatible endpoint works — point it at a local Ollama instance, an Azure deployment, a LiteLLM proxy, or your own model server. House doesn't care who serves the model. He only cares what the model finds.
+
+```python
+# Add a custom provider in ~/.everybody-lies/providers.json or via env:
+# Any OpenAI-compatible chat/completions endpoint works.
+export EVERYBODY_LIES_CUSTOM_BASE_URL="http://localhost:11434/v1"
+export EVERYBODY_LIES_CUSTOM_API_KEY="ollama"
+```
+
+If all providers fail, House tells you exactly why — and it's probably your fault.
 
 ## Configuration
 
