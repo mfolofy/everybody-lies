@@ -1,0 +1,1479 @@
+"""House — Code Review Gatekeeper.
+
+Dispatches a multi-specialist code review against a git diff.
+Routes changed files to domain specialists, collects findings,
+and issues a final verdict. ITIL-compliant throughout.
+
+This module is the core review pipeline. The CLI lives in cli.py.
+"""
+
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from .config import (
+    get_config_dir,
+    get_review_board_path,
+    get_reviews_dir,
+    get_stats_path,
+    get_dynamic_fellows_path,
+    ensure_config_dir,
+)
+from .providers import (
+    PROVIDERS,
+    call_llm,
+    resolve_specialist_model,
+    auto_detect_model,
+    detect_available_providers,
+)
+from .scanner import scan_diff, format_scan_result, is_trivial_diff
+from .learning import (
+    load_suppression_rules,
+    is_suppressed,
+    format_suppression_suggestions,
+    detect_recurring_problems,
+    format_problem_alerts,
+    auto_create_problem_records,
+)
+
+
+# ── Dynamic Fellow System ─────────────────────────────────────────────────────
+
+# Domain keywords → suggested fellow. House auto-hires when code touches
+# domains that no existing fellow covers.
+DOMAIN_HINTS = {
+    "trading": {
+        "keywords": ["trading_core", "gs-rev", "portfolio", "kelly", "position_size",
+                     "stop_loss", "take_profit", "order_book", "exchange", "binance",
+                     "kalshi", "polymarket", "alpaca", "market_data", "candle"],
+        "domain": "Crypto & Algorithmic Trading",
+        "expertise": "crypto markets, exchange APIs, order execution, risk management, Kelly criterion, technical indicators, market microstructure",
+    },
+    "quant": {
+        "keywords": ["backtest", "sharpe_ratio", "alpha", "volatility", "var", "cvar",
+                     "monte_carlo", "regression", "time_series", "statistical", "pandas_ta",
+                     "numpy", "scipy", "correlation", "covariance"],
+        "domain": "Quantitative Finance",
+        "expertise": "statistical modeling, backtesting methodology, financial mathematics, risk metrics, time-series analysis, portfolio theory",
+    },
+    "blockchain": {
+        "keywords": ["solidity", "web3", "ethereum", "contract", "nft", "defi",
+                     "metamask", "wallet", "transaction", "gas", "blockchain", "token"],
+        "domain": "Blockchain & Smart Contracts",
+        "expertise": "smart contract security, gas optimization, DeFi protocols, token standards (ERC-20/721/1155), wallet integration, transaction lifecycle",
+    },
+    "ml_ai": {
+        "keywords": ["train", "inference", "model", "neural", "embedding", "vector",
+                     "llm", "transformer", "fine_tune", "rag", "tokenizer", "pytorch",
+                     "tensorflow", "mlx", "qdrant", "pinecone", "langchain"],
+        "domain": "Machine Learning & AI",
+        "expertise": "model architecture, training pipelines, inference optimization, RAG systems, embeddings, GPU memory management, LLM deployment",
+    },
+    "devops_infra": {
+        "keywords": ["docker", "kubernetes", "k8s", "terraform", "ansible", "helm",
+                     "ci_cd", "github_actions", "jenkins", "argo", "prometheus",
+                     "grafana", "alert", "pagerduty", "slo", "sla"],
+        "domain": "DevOps & Infrastructure",
+        "expertise": "container orchestration, IaC, CI/CD pipelines, observability, SRE practices, incident response, capacity planning",
+    },
+    "database": {
+        "keywords": ["migration", "schema", "index", "query", "postgres", "mysql",
+                     "mongo", "redis", "sql", "nosql", "replication", "shard",
+                     "backup", "restore", "acid", "transaction"],
+        "domain": "Database Engineering",
+        "expertise": "schema design, query optimization, indexing strategy, replication, backup/restore, ACID compliance, migration safety",
+    },
+}
+
+# Track dynamically hired fellows (persisted to disk for cross-session continuity)
+_dynamic_fellows: dict[str, dict] = {}
+
+
+def _load_dynamic_fellows() -> dict[str, dict]:
+    """Load persisted dynamic fellows from disk."""
+    path = get_dynamic_fellows_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_dynamic_fellows() -> None:
+    """Persist dynamic fellows to disk for cross-session continuity."""
+    ensure_config_dir()
+    path = get_dynamic_fellows_path()
+    path.write_text(json.dumps(_dynamic_fellows, indent=2), encoding="utf-8")
+
+
+def _detect_uncovered_domains(files: list[str], existing_specialists: list[dict]) -> list[dict]:
+    """Analyze file paths for domains not covered by existing specialists."""
+    covered_domains = set()
+    for spec in existing_specialists:
+        for d in spec.get("domains", []):
+            covered_domains.add(d)
+
+    detected = []
+    for domain_key, hint in DOMAIN_HINTS.items():
+        if hint["domain"].lower() in covered_domains:
+            continue
+        matched = any(
+            any(kw in f.lower() for kw in hint["keywords"])
+            for f in files
+        )
+        if matched:
+            detected.append({
+                "key": domain_key,
+                "domain": hint["domain"],
+                "expertise": hint["expertise"],
+                "trigger_files": [f for f in files if any(kw in f.lower() for kw in hint["keywords"])],
+            })
+    return detected
+
+
+def _hire_fellow(domain_info: dict, tier: str, board: dict) -> dict:
+    """Create a new specialist fellow for an uncovered domain."""
+    domain = domain_info["domain"]
+    expertise = domain_info["expertise"]
+    key = domain_info["key"]
+    trigger_files = domain_info.get("trigger_files", [])
+
+    patterns = set()
+    for f in trigger_files:
+        parts = f.split("/")
+        if len(parts) > 1:
+            patterns.add(f"{parts[0]}/**")
+        else:
+            patterns.add(f"**/{f}")
+
+    review_prompt = textwrap.dedent(f"""\
+        You are a {domain} specialist, dynamically hired by House to review code
+        touching domains no existing fellow covers.
+
+        Your expertise: {expertise}
+
+        Review the provided code diff for domain-specific issues:
+
+        1. DOMAIN CORRECTNESS:
+           - Does the implementation follow {domain} best practices?
+           - Are there domain-specific pitfalls or anti-patterns?
+           - Are the assumptions correct for this domain?
+
+        2. DOMAIN SAFETY:
+           - What are the domain-specific failure modes?
+           - Are edge cases handled correctly for {domain}?
+           - What domain-specific security concerns exist?
+
+        3. DOMAIN PERFORMANCE:
+           - Are there domain-specific performance considerations?
+           - Is the approach optimal for {domain} workloads?
+
+        For each finding, provide:
+        1. Severity (P1/P2/P3/P4)
+        2. Exact file and line number
+        3. What's wrong (domain-specific)
+        4. How to fix it
+        5. Impact if not fixed
+
+        You were hired because no existing fellow covers {domain}.
+        Prove your worth.""")
+
+    fellow_id = f"dynamic-{key}"
+    if fellow_id in _dynamic_fellows:
+        return _dynamic_fellows[fellow_id]
+
+    fellow = {
+        "id": fellow_id,
+        "name": f"{domain} Specialist",
+        "title": f"{domain} SME",
+        "emoji": "🔧",
+        "domains": [domain.lower()],
+        "model_overrides": {"preferred": "deepseek-v4-flash", "standard": "deepseek-v4-flash", "budget": None},
+        "file_patterns": sorted(patterns),
+        "review_prompt": review_prompt,
+        "dynamic": True,
+        "hired_for": trigger_files,
+        "review_count": 0,
+        "unique_findings": 0,
+    }
+
+    _dynamic_fellows[fellow_id] = fellow
+    return fellow
+
+
+def _maybe_fire_fellow(fellow_id: str) -> bool:
+    """Fire a dynamic fellow if they consistently produce no unique findings."""
+    fellow = _dynamic_fellows.get(fellow_id)
+    if not fellow:
+        return False
+    review_count = fellow.get("review_count", 0)
+    unique_findings = fellow.get("unique_findings", 0)
+    if review_count >= 5 and unique_findings == 0:
+        del _dynamic_fellows[fellow_id]
+        return True
+    return False
+
+
+def _get_all_specialists(board: dict) -> list[dict]:
+    """Get all specialists: static from board + dynamically hired fellows."""
+    return list(board.get("specialists", [])) + list(_dynamic_fellows.values())
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _safe(text: str) -> str:
+    """Strip non-ASCII characters for safe terminal output."""
+    return text.encode("ascii", errors="replace").decode("ascii")
+
+
+def _load_json(path: Path) -> dict:
+    """Load a JSON file. Exit with message if missing or malformed."""
+    if not path.exists():
+        print(f"ERROR: {path} not found.", file=sys.stderr)
+        sys.exit(1)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _get_git_diff(staged: bool = False, diff_arg: str = "") -> str:
+    """Get git diff. Priority: diff_arg > staged > unstaged."""
+    if diff_arg:
+        return diff_arg
+    try:
+        if staged:
+            result = subprocess.run(
+                ["git", "diff", "--cached"],
+                capture_output=True, cwd=Path.cwd(), timeout=10,
+            )
+        else:
+            result = subprocess.run(
+                ["git", "diff"],
+                capture_output=True, cwd=Path.cwd(), timeout=10,
+            )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace").strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def _get_changed_files(diff_text: str) -> list[str]:
+    """Extract changed file paths from a unified diff."""
+    files = set()
+    for line in diff_text.split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                files.add(parts[3][2:])  # strip b/
+        elif line.startswith("--- a/") or line.startswith("+++ b/"):
+            f = line[6:]
+            if f != "/dev/null":
+                files.add(f)
+    return sorted(files)
+
+
+def _route_to_specialists(files: list[str], board: dict) -> dict[str, list[str]]:
+    """Route files to specialists based on domain routing rules."""
+    routing_rules = board.get("domain_routing", {}).get("routing_rules", [])
+    default_specialists = board.get("domain_routing", {}).get("default_specialists", [])
+
+    specialist_files: dict[str, set[str]] = {}
+    for spec in board.get("specialists", []):
+        specialist_files[spec["id"]] = set()
+
+    for f in files:
+        routed = False
+        for rule in routing_rules:
+            if fnmatch.fnmatch(f, rule["pattern"]):
+                for spec_id in rule["specialists"]:
+                    if spec_id in specialist_files:
+                        specialist_files[spec_id].add(f)
+                routed = True
+        if not routed:
+            for spec_id in default_specialists:
+                if spec_id in specialist_files:
+                    specialist_files[spec_id].add(f)
+
+    return {k: sorted(v) for k, v in specialist_files.items() if v}
+
+
+def _filter_diff_for_files(diff_text: str, files: list[str]) -> str:
+    """Extract only the hunks relevant to the given files from a unified diff."""
+    if not files or not diff_text:
+        return diff_text
+
+    lines = diff_text.split("\n")
+    filtered: list[str] = []
+    current_file = ""
+    include_current = False
+
+    for line in lines:
+        if line.startswith("diff --git"):
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                current_file = parts[3][2:]
+                include_current = current_file in files
+        elif line.startswith("--- a/") or line.startswith("+++ b/"):
+            f = line[6:]
+            if f != "/dev/null":
+                current_file = f
+                include_current = current_file in files
+
+        if include_current:
+            filtered.append(line)
+        elif line.startswith("diff --git"):
+            filtered.append(line)
+
+    return "\n".join(filtered)
+
+
+def _call_specialist(spec: dict, model: str, diff_text: str,
+                     max_tokens: int) -> tuple[str, str, str]:
+    """Call a single specialist. Returns (specialist_id, model_used, response_text)."""
+    system = textwrap.dedent(f"""\
+        You are {spec['name']}, {spec['title']} on the House code review board.
+
+        {spec['review_prompt']}
+
+        IMPORTANT: Structure your response as:
+
+        ## Findings
+        For each finding:
+        - **Severity:** P1/P2/P3/P4
+        - **File:** path:line
+        - **Issue:** what's wrong
+        - **Fix:** how to fix it
+        - **Impact:** what happens if we don't fix this
+
+        ## Summary
+        - Total findings: N
+        - P1 (blocking): N
+        - P2 (high): N
+        - P3 (medium): N
+        - P4 (low): N
+        - **Verdict:** PASS or FAIL
+
+        Be specific. Cite exact file paths and line numbers. No hand-waving.
+        If the code is clean, say so and PASS. Do not invent problems.""")
+
+    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.4)
+    return spec["id"], model, response
+
+
+def _call_cuddy(cuddy_spec: dict, model: str, diff_text: str,
+                 max_tokens: int, spec_content: str = "") -> tuple[str, str, str]:
+    """Run Cuddy's pre-review differential diagnosis.
+    Returns (specialist_id, model_used, response_text).
+    """
+    system = textwrap.dedent(f"""\
+        You are {cuddy_spec['name']}, {cuddy_spec['title']}. You are House's boss.
+
+        {cuddy_spec['review_prompt']}""")
+
+    # If specs are available, add them as ground truth
+    if spec_content:
+        system += textwrap.dedent(f"""\
+
+            CRITICAL — SPECIFICATIONS PROVIDED:
+            The following specifications/requirements were detected in the repository.
+            Use them as GROUND TRUTH for your differential diagnosis.
+            Check whether the code change satisfies every requirement in the spec.
+            If the spec says X and the code does Y without justification → P1.
+            If the code changes something the spec doesn't mention → rule out whether it's necessary.
+
+            {spec_content}
+
+            END SPECIFICATIONS""")
+
+    system += textwrap.dedent("""
+
+        IMPORTANT: Structure your response as:
+
+        ## Differential Diagnosis
+        For each simpler alternative you considered:
+        - **Alternative:** what's the simpler approach?
+        - **Ruled out?:** YES (with evidence) / NO (developer didn't address this)
+        - **If not ruled out:** specific file:line where the current approach lives, and why the alternative is better
+
+        ## Spec Compliance (if specs provided)
+        - **Requirement:** what the spec requires
+        - **Satisfied?:** YES / NO / PARTIAL — with evidence from the diff
+        - **If not satisfied:** what's missing and where
+
+        ## Summary
+        - Total alternatives considered: N
+        - Ruled out (justified): N
+        - NOT ruled out (must address): N
+        - **Verdict:** PASS (all alternatives ruled out, spec satisfied) or FAIL (simpler approach exists, not justified, or spec not met)
+
+        Be specific. If you propose a simpler alternative, describe it concretely.
+        Cite exact file paths and line numbers for the code under scrutiny.
+        This is a differential diagnosis — rule out everything simpler FIRST.""")
+
+    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.4)
+    return cuddy_spec["id"], model, response
+
+
+def _call_house_synthesis(house_config: dict, specialist_findings: list[dict],
+                           cuddy_finding: dict | None,
+                           scan_result,  # ScanResult from scanner.py
+                           problem_alerts: str,  # Cross-review problem detection
+                           suppression_suggestions: str,  # Dismissal learning
+                           model: str, change_title: str,
+                           max_tokens: int) -> str:
+    """House synthesizes all specialist findings into a final verdict.
+
+    scan_result: Deterministic pre-scan findings (runs BEFORE Cuddy). Zero-cost, high-confidence.
+    cuddy_finding: Cuddy's pre-review differential diagnosis (runs second).
+    """
+    # Scan findings FIRST — deterministic, zero-hallucination, high-signal
+    findings_text = ""
+    if scan_result and scan_result.total > 0:
+        findings_text += (
+            f"## DETERMINISTIC PRE-SCAN — Pattern-Based Findings\n"
+            f"These were caught by pattern matching BEFORE any AI review. "
+            f"They are high-confidence, zero-hallucination findings.\n\n"
+            f"Findings: {scan_result.total} total "
+            f"(P1={scan_result.p1_count}, P2={scan_result.p2_count}, "
+            f"P3={scan_result.p3_count}, P4={scan_result.p4_count})\n"
+        )
+        for f in scan_result.findings:
+            findings_text += (f"- [{f.severity}] **{f.rule}**: {f.file}:{f.line}"
+                              f" — {f.message}\n  Fix: {f.fix}\n")
+        findings_text += "\n---\n\n"
+
+    # Cuddy's findings SECOND — if the approach is wrong, code quality is irrelevant
+    if cuddy_finding:
+        findings_text += (
+            f"## CUDDY — DIFFERENTIAL DIAGNOSIS (Pre-Review)\n"
+            f"Cuddy reviewed this code FIRST. Her job was to rule out every simpler alternative "
+            f"before the specialists even looked at it. If she found un-ruled-out alternatives, "
+            f"the approach itself is in question and code-quality findings are secondary.\n\n"
+            f"### Cuddy's Findings ({cuddy_finding['model']})\n"
+            f"{cuddy_finding['response'][:3000]}\n"
+            f"---\n"
+            f"END CUDDY DIFFERENTIAL DIAGNOSIS\n"
+            f"---\n\n"
+        )
+
+    for sf in specialist_findings:
+        findings_text += f"\n### {sf['specialist_name']} ({sf['model']})\n{sf['response'][:3000]}\n"
+        findings_text += "\n---\n"
+
+    system = textwrap.dedent(f"""\
+        You are {house_config['name']}, {house_config['role']}. You lead a review board of insufferable specialists. Cuddy, your boss, has already performed a differential diagnosis. Synthesize ALL findings — Cuddy's FIRST — into a final verdict.
+
+        {house_config['review_prompt']}
+
+        CRITICAL: Cuddy runs BEFORE you. She is your boss. Her differential diagnosis checks whether simpler alternatives were ruled out. If she found un-ruled-out simpler approaches, those are BLOCKING regardless of what the specialists say. The code could be flawless and still be the wrong approach.
+
+        When weighing findings:
+        - Cuddy's findings trump everything. Wrong approach = automatic rejection, even if the code is perfect.
+        - If Cuddy says PASS (all alternatives ruled out), then the specialists' code-quality findings determine the verdict normally.
+        - A simpler alternative that wasn't ruled out IS a P2. A simpler alternative that is objectively better IS a P1.
+
+        If Cuddy's findings are present, address them FIRST in your synthesis. The specialists' findings come SECOND.
+
+        IMPORTANT: Structure your response as:
+
+        ## House's Final Verdict: APPROVED or REJECTED
+
+        ## Cuddy's Differential — Ruling
+        (Address Cuddy's findings here. Did she find un-ruled-out alternatives? Are they blocking?)
+        - Cuddy: PASS (all alternatives ruled out) or FAIL (simpler approach exists, not justified)
+
+        ## Findings Summary
+        """ + ("- Cuddy: N simpler alternatives found (P1: N, P2: N) -- PASS/FAIL\n" if cuddy_finding else "") + """\
+        - Foreman: N findings (P1: N, P2: N, P3: N, P4: N) -- PASS/FAIL
+        - Cameron: N findings (P1: N, P2: N, P3: N, P4: N) -- PASS/FAIL
+        - Chase: N findings (P1: N, P2: N, P3: N, P4: N) -- PASS/FAIL
+        - Taub: N findings (P1: N, P2: N, P3: N, P4: N) -- PASS/FAIL
+        - Thirteen: N findings (P1: N, P2: N, P3: N, P4: N) -- PASS/FAIL
+
+        ## Blocking Issues (P1/P2)
+        List every P1 and P2 finding here with exact file:line, issue, and fix.
+        Cuddy's un-ruled-out alternatives go FIRST if any exist.
+
+        ## Recommendations (P3/P4)
+        List P3/P4 items -- these should be fixed but don't block commit.
+
+        ## Conflicts Between Reviewers
+        Did any specialists disagree? Resolve the conflict.
+        If Cuddy says PASS but a specialist found approach-level issues, reconcile.
+
+        ## ITIL Assessment
+        - Risk score: (1-5)
+        - Rollback plan: (describe)
+        - Deploy window: (immediate / scheduled / maintenance window)
+
+        ## House's Signature
+        If APPROVED: "I, House, authorize this change. Do not make me regret it."
+        If REJECTED: "REJECTED. Fix the above and come back. I'll be waiting."
+
+        Be brutal. Be specific. No sugar-coating. This is your reputation.""")
+
+    # Append cross-review intelligence
+    if problem_alerts:
+        findings_text += f"\n---\n\n{problem_alerts}\n\n---\n\n"
+    if suppression_suggestions:
+        findings_text += f"\n---\n\n{suppression_suggestions}\n\n---\n\n"
+
+    user = f"Change: {change_title}\n\nReview findings:\n{findings_text}"
+    return call_llm(model, system, user, max_tokens=max_tokens, temperature=0.5)
+
+
+def _calculate_risk_score(files: list[str], diff_text: str) -> float:
+    """Auto-calculate risk score based on files changed and diff size."""
+    lines_changed = len([l for l in diff_text.split("\n") if l.startswith("+") or l.startswith("-")])
+    n_files = len(files)
+
+    lines_score = 1 if lines_changed < 50 else (3 if lines_changed < 200 else 5)
+    files_score = 1 if n_files <= 2 else (3 if n_files <= 5 else 5)
+
+    high_risk_patterns = [
+        "**/auth*", "**/login*", "**/password*", "**/token*", "**/session*",
+        "**/billing*", "**/payment*", "**/checkout*", "**/trading*",
+        "**/secrets*", "**/credentials*", "**/api_key*",
+        "**/migration*", "**/*.sql",
+    ]
+    domain_risk = 1
+    for f in files:
+        for pattern in high_risk_patterns:
+            if fnmatch.fnmatch(f, pattern):
+                domain_risk = max(domain_risk, 5)
+                break
+        if "auth" in f.lower() or "token" in f.lower() or "security" in f.lower():
+            domain_risk = max(domain_risk, 5)
+
+    score = (lines_score * 0.20) + (files_score * 0.15) + (domain_risk * 0.65)
+    return round(score, 1)
+
+
+def _recommend_tier(risk_score: float) -> str:
+    """Recommend review tier based on risk score."""
+    if risk_score < 2.0:
+        return "fast"
+    elif risk_score < 3.6:
+        return "standard"
+    else:
+        return "adversarial"
+
+
+def _build_output_paths(title: str) -> tuple[Path, Path]:
+    """Build output file paths for markdown and JSON reports."""
+    reviews_dir = get_reviews_dir()
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    slug = title.lower().replace(" ", "-").replace("/", "-")
+    slug = re.sub(r'[<>:"|?*\\]', '', slug)
+    slug = re.sub(r'-+', '-', slug)
+    slug = slug.strip("-.")[:60]
+    if not slug:
+        slug = "untitled-review"
+
+    md_path = reviews_dir / f"house-{date_str}-{slug}.md"
+    json_path = reviews_dir / f"house-{date_str}-{slug}.json"
+
+    counter = 1
+    while md_path.exists():
+        md_path = reviews_dir / f"house-{date_str}-{slug}-r{counter}.md"
+        json_path = reviews_dir / f"house-{date_str}-{slug}-r{counter}.json"
+        counter += 1
+
+    return md_path, json_path
+
+
+def _update_stats(review_data: dict) -> None:
+    """Update review statistics."""
+    stats_path = get_stats_path()
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stats = {}
+    if stats_path.exists():
+        try:
+            stats = _load_json(stats_path)
+        except Exception:
+            stats = {}
+    stats.setdefault("reviews", []).append({
+        "timestamp": review_data.get("timestamp", ""),
+        "rfc_id": review_data.get("rfc_id", ""),
+        "verdict": review_data.get("verdict", ""),
+        "tier": review_data.get("review_tier", ""),
+        "risk_score": review_data.get("risk_score", 0),
+        "files_changed": len(review_data.get("affected_files", [])),
+    })
+    stats["reviews"] = stats["reviews"][-100:]
+    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+
+
+def _print_dry_run_prompts(diff_text: str, files: list[str], specialists: list[dict],
+                           routing: dict[str, list[str]],
+                           board: dict, house_config: dict) -> None:
+    """Print specialist prompts for external execution (Thor/OpenCode)."""
+    print("=" * 80)
+    print("HOUSE GATEKEEPER -- DRY RUN (Prompts for External Execution)")
+    print("=" * 80)
+
+    # Cuddy goes FIRST
+    cuddy_spec = next((s for s in board.get("specialists", []) if s.get("pre_review") and s["id"] == "cuddy"), None)
+    if cuddy_spec and diff_text.strip():
+        print(f"\n{'-' * 80}")
+        print(f"PRE-REVIEW -- DIFFERENTIAL DIAGNOSIS: {cuddy_spec['name']} -- {cuddy_spec['title']}")
+        print(f"FILES: ALL ({len(files)} files) -- Cuddy reviews everything to rule out simpler alternatives")
+        print(f"{'-' * 80}")
+        print(f"\nSYSTEM PROMPT:\n{cuddy_spec['review_prompt'][:500]}...")
+        safe_diff = _safe(diff_text[:2000])
+        print(f"\nUSER INPUT (full diff):\n{safe_diff}")
+        if len(diff_text) > 2000:
+            print(f"\n... ({len(diff_text) - 2000} more chars)")
+        print(f"\n{'-' * 80}")
+        print(f"Send Cuddy's differential diagnosis to House along with specialist findings.")
+        print(f"Cuddy's findings trump all. Wrong approach = automatic rejection.\n")
+
+    for spec in board["specialists"]:
+        if spec.get("pre_review"):
+            continue  # Cuddy already shown above
+        spec_files = routing.get(spec["id"], [])
+        if not spec_files:
+            continue
+        spec_diff = _filter_diff_for_files(diff_text, spec_files)
+        if not spec_diff.strip():
+            continue
+
+        print(f"\n{'-' * 80}")
+        print(f"SPECIALIST: {spec['name']} -- {spec['title']}")
+        print(f"FILES: {', '.join(spec_files[:10])}")
+        if len(spec_files) > 10:
+            print(f"  ... and {len(spec_files) - 10} more files")
+        print(f"{'-' * 80}")
+        print(f"\nSYSTEM PROMPT:\n{spec['review_prompt'][:500]}...")
+        safe_diff = _safe(spec_diff[:2000])
+        print(f"\nUSER INPUT (diff):\n{safe_diff}")
+        if len(spec_diff) > 2000:
+            print(f"\n... ({len(spec_diff) - 2000} more chars)")
+
+    print(f"\n{'-' * 80}")
+    print(f"HOUSE SYNTHESIS -- {house_config['name']}")
+    print(f"{'-' * 80}")
+    print(f"\nSend all specialist responses to House for final verdict.")
+    safe_prompt = _safe(house_config['review_prompt'][:300])
+    print(f"House prompt: {safe_prompt}...")
+
+
+# ── Main Pipeline ─────────────────────────────────────────────────────────────
+
+
+def run_review(
+    diff_text: str = "",
+    files: Optional[list[str]] = None,
+    tier: str = "standard",
+    title: str = "",
+    change_type: str = "normal",
+    staged: bool = False,
+    dry_run: bool = False,
+    max_tokens: int = 4096,
+    ci_mode: Optional[str] = None,
+    spec_mode: bool = False,
+    spec_file: Optional[str] = None,
+) -> dict:
+    """Run the full House gatekeeper review pipeline.
+
+    Returns a dict with the complete review data (verdict, findings, RFC record).
+    Exit code convention: 0 = APPROVED, 1 = REJECTED (set by caller).
+    """
+    global _dynamic_fellows
+    _dynamic_fellows = _load_dynamic_fellows()
+
+    # Ensure config directory exists
+    ensure_config_dir()
+
+    board = _load_json(get_review_board_path())
+    house_config = board["gatekeeper"]
+    static_specialists = board.get("specialists", [])
+
+    # ── Detect domain gaps + auto-hire dynamic fellows ─────────────────
+    if files or diff_text:
+        if not files:
+            files = _get_changed_files(diff_text)
+        if files:
+            gaps = _detect_uncovered_domains(files, static_specialists)
+            for gap in gaps:
+                auto_hire_threshold = board.get("dynamic_fellows", {}).get("auto_hire_threshold", 3)
+                if len(gap.get("trigger_files", [])) >= auto_hire_threshold:
+                    fellow = _hire_fellow(gap, tier, board)
+                    print(f"  [HIRED] {fellow['name']} for {gap['domain']} "
+                          f"(triggered by {', '.join(gap['trigger_files'][:2])})")
+                else:
+                    print(f"  [GAP] {gap['domain']} detected but only "
+                          f"{len(gap.get('trigger_files', []))} files — threshold {auto_hire_threshold}")
+
+    specialists = _get_all_specialists(board)
+
+    # ── Get diff ──────────────────────────────────────────────────────
+    if not diff_text:
+        diff_text = _get_git_diff(staged=staged)
+    if not diff_text:
+        print("ERROR: No diff found. Stage changes or use --diff.", file=sys.stderr)
+        sys.exit(1)
+
+    if not files:
+        files = _get_changed_files(diff_text)
+    if not files:
+        print("ERROR: No changed files detected in diff.", file=sys.stderr)
+        sys.exit(1)
+
+    if not title:
+        title = f"Review of {len(files)} file(s): {', '.join(files[:3])}"
+        if len(files) > 3:
+            title += f" +{len(files) - 3} more"
+
+    # ── Triage ────────────────────────────────────────────────────────
+    routing = _route_to_specialists(files, board)
+    risk_score = _calculate_risk_score(files, diff_text)
+    recommended_tier = _recommend_tier(risk_score)
+
+    print(f"\n{'=' * 70}")
+    print(f"  HOUSE GATEKEEPER -- Code Review")
+    print(f"{'=' * 70}")
+    print(f"  Change: {title}")
+    print(f"  Files:  {len(files)}")
+    print(f"  Risk:   {risk_score}/5.0 -> recommended tier: {recommended_tier}")
+    print(f"  Tier:   {tier}")
+    print(f"  Type:   {change_type}")
+    if recommended_tier != tier:
+        print(f"  [!] Tiers don't match -- Orchestrator chose {tier}, House recommends {recommended_tier}")
+    print(f"{'=' * 70}\n")
+
+    for spec_id, spec_files in routing.items():
+        spec_name = next((s["name"] for s in specialists if s["id"] == spec_id), spec_id)
+        print(f"  {spec_name}: {len(spec_files)} file(s) -- {', '.join(spec_files[:3])}{'...' if len(spec_files) > 3 else ''}")
+
+    # Initialize tracking vars (used by scan, Cuddy, specialists)
+    all_pass = True
+    blocking_findings: list[str] = []
+
+    # Show auto-detected configuration
+    if not dry_run:
+        available = detect_available_providers()
+        auto_model = auto_detect_model()
+        if available:
+            provider_names = [PROVIDERS[p]["name"] for p in available]
+            print(f"  [CONFIG] Auto-detected: {auto_model} via {', '.join(provider_names)}")
+            missing = [p for p in PROVIDERS if p not in available]
+            if missing:
+                optional_names = [f"{PROVIDERS[p]['env_key']}" for p in missing]
+                print(f"  [CONFIG] Optional: set {' or '.join(optional_names)} for cheaper/faster routing")
+        else:
+            print(f"\n{'=' * 70}")
+            print(f"  NO API KEYS DETECTED")
+            print(f"  Set at least one of:")
+            for p_key, p_info in PROVIDERS.items():
+                print(f"    export {p_info['env_key']}=\"your-key\"   # {p_info['name']} ({p_info['cost_note']})")
+            print(f"")
+            print(f"  Claude Code users: your ANTHROPIC_API_KEY is already set in your env.")
+            print(f"  If running as a Claude Code skill, subagents inherit your model automatically.")
+            print(f"")
+            print(f"  For testing without API keys: everybody-lies --dry-run")
+            print(f"{'=' * 70}\n")
+
+    # ── Deterministic Pre-Scan ───────────────────────────────────────
+    # Zero-cost pattern matching BEFORE any AI review. Catches what AI
+    # reviewers consistently miss (per arXiv 2603.25773, March 2026).
+    # Load suppression rules (user-defined + auto-learned)
+    suppression_rules = load_suppression_rules()
+
+    scan_result = scan_diff(diff_text, files)
+    original_scan_total = scan_result.total
+
+    # Apply suppression rules to scan findings (learned from dismissals)
+    if suppression_rules:
+        scan_result.findings = [
+            f for f in scan_result.findings
+            if not is_suppressed(f.rule, f.file, suppression_rules)
+        ]
+    suppressed_scan_count = original_scan_total - scan_result.total
+
+    trivial, trivial_reason = is_trivial_diff(diff_text, files)
+
+    print(f"\n  [SCAN] Deterministic pre-scan: {scan_result.files_scanned} files, "
+          f"{scan_result.lines_scanned} lines ({scan_result.duration_ms}ms)")
+    if scan_result.total > 0:
+        print(f"         {scan_result.total} findings: "
+              f"P1={scan_result.p1_count} P2={scan_result.p2_count} "
+              f"P3={scan_result.p3_count} P4={scan_result.p4_count}")
+        if suppressed_scan_count > 0:
+            print(f"         ({suppressed_scan_count} suppressed by rules)")
+        for f in scan_result.findings[:5]:
+            print(f"         [{f.severity}] {f.rule}: {f.file}:{f.line}")
+        if scan_result.total > 5:
+            print(f"         ... and {scan_result.total - 5} more")
+    else:
+        if suppressed_scan_count > 0:
+            print(f"         Clean — {suppressed_scan_count} findings suppressed by rules")
+        else:
+            print(f"         Clean — no patterns matched")
+
+    if trivial:
+        print(f"  [TRIVIAL] This diff looks trivial: {trivial_reason}")
+        if not scan_result.has_blockers:
+            print(f"  [FAST-TRACK] Trivial diff, no scan blockers — APPROVED without AI review.")
+            # Build a minimal approval record
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            md_path, json_path = _build_output_paths(title)
+            review_data = {
+                "rfc_id": md_path.stem.replace("house-", "RFC-"),
+                "timestamp": timestamp,
+                "change_type": change_type,
+                "review_tier": tier,
+                "risk_score": risk_score,
+                "change_title": title,
+                "affected_files": files,
+                "verdict": "APPROVED",
+                "fast_track": True,
+                "fast_track_reason": trivial_reason,
+                "deterministic_scan": scan_result.to_dict(),
+                "signed_by": "House (Gatekeeper) — Fast-Track (no AI review needed)",
+            }
+            md_path.write_text(_build_fast_track_report(review_data, scan_result), encoding="utf-8")
+            json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
+            print(f"  [REPORT] {md_path}")
+            print(f"\n{'=' * 70}")
+            print(f"  [APPROVED] VERDICT: APPROVED (Fast-Track)")
+            print(f"  Reason: {trivial_reason}. Deterministic scan clean.")
+            print(f"  Signed: House (Gatekeeper)")
+            print(f"{'=' * 70}\n")
+            return review_data
+        else:
+            print(f"  [SCAN] Trivial diff but has P1 scan findings — proceeding to AI review.")
+            blocking_findings.append(f"Scanner: {scan_result.p1_count} P1 finding(s) in deterministic scan")
+
+    # ── Dry run ───────────────────────────────────────────────────────
+    if dry_run:
+        _print_dry_run_prompts(diff_text, files, specialists, routing, board, house_config)
+        return {"status": "dry_run", "verdict": "dry_run", "routing": routing}
+
+    # ── Spec Detection ────────────────────────────────────────────────
+    # Auto-detect spec files for Cuddy's differential diagnosis.
+    # Per arXiv 2603.25773: specs catch what all AI reviewers miss.
+    spec_content = ""
+    if spec_mode and not spec_file:
+        # Auto-detect: look for SPEC.md, *.feature, spec files in repo
+        spec_candidates = list(Path.cwd().rglob("SPEC.md")) + \
+                         list(Path.cwd().rglob("*SPEC*")) + \
+                         list(Path.cwd().rglob("*.feature"))
+        for candidate in spec_candidates[:3]:  # max 3 files
+            try:
+                content = candidate.read_text(encoding="utf-8")
+                spec_content += f"\n### {candidate.name}\n{content[:3000]}\n"
+            except Exception:
+                pass
+        if spec_content:
+            print(f"  [SPEC] Detected spec files — Cuddy will use them as ground truth")
+    elif spec_file:
+        try:
+            spec_content = Path(spec_file).read_text(encoding="utf-8")
+            print(f"  [SPEC] Loaded {spec_file} — Cuddy will use it as ground truth")
+        except Exception as exc:
+            print(f"  [SPEC] Failed to load {spec_file}: {exc}")
+
+    # ── Cuddy — Differential Diagnosis (PRE-REVIEW) ──────────────────
+    # Cuddy runs FIRST, before any specialist. She reviews the FULL diff
+    # (not domain-filtered) because her job is approach validation, not bug hunting.
+    cuddy_spec = next((s for s in specialists if s.get("pre_review") and s["id"] == "cuddy"), None)
+    cuddy_finding: dict | None = None
+
+    if cuddy_spec and diff_text.strip():
+        cuddy_model = resolve_specialist_model(cuddy_spec, tier, board)
+        print(f"\n  [CUDDY — DIFFERENTIAL DIAGNOSIS] {cuddy_spec['name']} ({cuddy_spec['title']})")
+        print(f"  Ruling out simpler alternatives before the specialists touch this...")
+        print(f"  Model: {cuddy_model}")
+
+        try:
+            cuddy_id, cuddy_model_used, cuddy_response = _call_cuddy(
+                cuddy_spec, cuddy_model, diff_text, max_tokens, spec_content,
+            )
+            print(f"    -> {len(cuddy_response)} chars received")
+            cuddy_finding = {
+                "specialist_id": cuddy_id,
+                "specialist_name": cuddy_spec["name"],
+                "model": cuddy_model_used,
+                "response": cuddy_response,
+                "files_reviewed": files,
+                "pre_review": True,
+            }
+            # Check Cuddy's findings for blockers
+            if "P1" in cuddy_response or "P1:" in cuddy_response:
+                blocking_findings.append(f"Cuddy: P1 — simpler alternative exists, approach is wrong")
+                all_pass = False
+            elif "FAIL" in cuddy_response[:500] or "FAIL" in cuddy_response.upper()[:200]:
+                all_pass = False
+        except Exception as exc:
+            print(f"    -> Cuddy unavailable: {exc}")
+            cuddy_finding = {
+                "specialist_id": cuddy_spec["id"],
+                "specialist_name": cuddy_spec["name"],
+                "model": "FAILED",
+                "response": f"**ERROR:** Cuddy unavailable for differential diagnosis. {exc}",
+                "verdict": "UNAVAILABLE",
+                "pre_review": True,
+            }
+
+    # ── Specialist review ─────────────────────────────────────────────
+    specialist_results: list[dict] = []
+
+    # Exclude Cuddy from specialist loop — she already ran as pre-review
+    active_specialists = [
+        s for s in specialists
+        if routing.get(s["id"]) and not s.get("pre_review")
+    ]
+    if not active_specialists:
+        print("WARNING: No specialists matched. Defaulting to Thirteen only.")
+        active_specialists = [s for s in specialists if s["id"] == "thirteen"]
+        for s in active_specialists:
+            routing[s["id"]] = files
+
+    for spec in active_specialists:
+        spec_files = routing.get(spec["id"], files)
+        spec_diff = _filter_diff_for_files(diff_text, spec_files)
+
+        if not spec_diff.strip():
+            print(f"\n  [{spec['id'].upper()}] {spec['name']}: No relevant diff -- SKIPPED")
+            specialist_results.append({
+                "specialist_id": spec["id"],
+                "specialist_name": spec["name"],
+                "model": "n/a",
+                "response": "No relevant code changes in this specialist's domain.",
+                "verdict": "PASS",
+            })
+            continue
+
+        model = resolve_specialist_model(spec, tier, board)
+        print(f"\n  [{spec['id'].upper()}] {spec['name']} ({spec['title']}) -- reviewing {len(spec_files)} file(s) with {model}...")
+
+        try:
+            spec_id, model_used, response = _call_specialist(spec, model, spec_diff, max_tokens)
+            print(f"    -> {len(response)} chars received")
+
+            specialist_results.append({
+                "specialist_id": spec_id,
+                "specialist_name": spec["name"],
+                "model": model_used,
+                "response": response,
+                "files_reviewed": spec_files,
+            })
+
+            if "P1" in response or "P1:" in response or "**Severity:** P1" in response:
+                blocking_findings.append(f"{spec['name']}: P1 found")
+                all_pass = False
+            elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                all_pass = False
+
+            if spec.get("dynamic"):
+                fid = spec["id"]
+                if fid in _dynamic_fellows:
+                    _dynamic_fellows[fid]["review_count"] = _dynamic_fellows[fid].get("review_count", 0) + 1
+                    findings_count = response.count("**Severity:**")
+                    if findings_count > 0:
+                        _dynamic_fellows[fid]["unique_findings"] = _dynamic_fellows[fid].get("unique_findings", 0) + findings_count
+
+        except Exception as exc:
+            print(f"    -> FAILED: {exc}")
+            fallback = "deepseek-v4-flash"
+            if fallback and fallback != model:
+                print(f"    -> Trying fallback {fallback}...")
+                try:
+                    spec_id, model_used, response = _call_specialist(spec, fallback, spec_diff, max_tokens)
+                    print(f"    -> {len(response)} chars received (via {fallback})")
+                    specialist_results.append({
+                        "specialist_id": spec_id,
+                        "specialist_name": spec["name"],
+                        "model": model_used,
+                        "response": response,
+                        "files_reviewed": spec_files,
+                    })
+                    continue
+                except Exception as exc2:
+                    print(f"    -> Fallback also failed: {exc2}")
+
+            specialist_results.append({
+                "specialist_id": spec["id"],
+                "specialist_name": spec["name"],
+                "model": "FAILED",
+                "response": f"**ERROR:** Specialist unavailable. {exc}",
+                "verdict": "UNAVAILABLE",
+            })
+
+    # ── Adversarial cross-check ───────────────────────────────────────
+    if tier == "adversarial":
+        secondary_model = "deepseek/deepseek-v4-flash"
+        for spec in active_specialists:
+            spec_files = routing.get(spec["id"], files)
+            spec_diff = _filter_diff_for_files(diff_text, spec_files)
+            if not spec_diff.strip():
+                continue
+            print(f"\n  [CROSS-CHECK] {spec['name']} -- adversarial cross-check with {secondary_model}...")
+            try:
+                _, model_used, response2 = _call_specialist(spec, secondary_model, spec_diff, max_tokens)
+                print(f"    -> {len(response2)} chars received")
+                specialist_results.append({
+                    "specialist_id": spec["id"],
+                    "specialist_name": f"{spec['name']} (cross-check)",
+                    "model": model_used,
+                    "response": response2,
+                    "files_reviewed": spec_files,
+                })
+                if "P1" in response2:
+                    all_pass = False
+            except Exception as exc:
+                print(f"    -> Cross-check failed: {exc}")
+
+    # ── Cross-Review Problem Detection ────────────────────────────────
+    # ITIL Problem Management: detect patterns across review history
+    recurring_problems = detect_recurring_problems(min_occurrences=3, lookback_reviews=20)
+    problem_alerts = format_problem_alerts(recurring_problems)
+    suppression_suggestions = format_suppression_suggestions()
+
+    if recurring_problems:
+        print(f"\n  [PROBLEM MGMT] {len(recurring_problems)} recurring issue(s) detected across review history")
+        for p in recurring_problems[:3]:
+            print(f"         {p['rule']}: {p['review_count']} reviews, affects {len(p['files'])} file(s)")
+        auto_create_problem_records(recurring_problems)
+
+    suppression_suggestions_list = [
+        r for r in (suppression_suggestions or "").split("\n") if r.startswith("- **")
+    ]
+    if suppression_suggestions_list:
+        print(f"  [SUPPRESS] {len(suppression_suggestions_list)} rule(s) have been dismissed enough times to suppress")
+        print(f"            Edit ~/.everybody-lies/suppress.toml to silence them")
+
+    # ── House synthesis ───────────────────────────────────────────────
+    house_model_config = board.get("model_config", {}).get("house_model", {})
+    tier_to_slot = board.get("model_config", {}).get("tier_to_slot", {})
+    slot = tier_to_slot.get(tier, "preferred")
+    synthesis_model = house_model_config.get(slot) or resolve_specialist_model({}, tier, board)
+    print(f"\n  [HOUSE] Synthesizing findings with {synthesis_model}...")
+
+    try:
+        synthesis = _call_house_synthesis(house_config, specialist_results, cuddy_finding, scan_result, problem_alerts, suppression_suggestions, synthesis_model, title, max_tokens)
+        print(f"    -> {len(synthesis)} chars received")
+    except Exception as exc:
+        print(f"    -> House synthesis failed: {exc}")
+        synthesis = f"**ERROR:** House synthesis unavailable. {exc}\n\nManual verdict required from Orchestrator."
+
+    # ── Determine verdict ─────────────────────────────────────────────
+    valid_responses = [r for r in specialist_results
+                       if r.get("model") not in ("n/a", "FAILED", "UNAVAILABLE")]
+    if not valid_responses:
+        verdict = "REJECTED"
+        failures = []
+        for r in specialist_results:
+            resp = r.get("response", "")
+            if "ERROR" in resp or "FAILED" in resp or "unavailable" in resp.lower():
+                failures.append(f"- {r['specialist_name']}: {resp[:200]}")
+        fail_detail = "\n".join(failures) if failures else "Unknown — all specialists failed to respond."
+        provider_names = ', '.join(PROVIDERS[p]['env_key'] for p in PROVIDERS)
+        synthesis = (f"**REJECTED:** All {len(specialist_results)} specialists failed. "
+                     f"House cannot review this change.\n\n"
+                     f"Failures:\n{fail_detail}\n\n"
+                     f"Check API keys ({provider_names}), "
+                     f"network connectivity, and model availability, then resubmit.")
+    elif all_pass and "APPROVED" in synthesis.upper()[:200]:
+        verdict = "APPROVED"
+    elif "REJECTED" in synthesis.upper()[:200]:
+        verdict = "REJECTED"
+    elif all_pass:
+        verdict = "APPROVED"
+    else:
+        verdict = "REJECTED"
+
+    # ── Build output ──────────────────────────────────────────────────
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    md_path, json_path = _build_output_paths(title)
+
+    review_data = {
+        "rfc_id": md_path.stem.replace("house-", "RFC-"),
+        "timestamp": timestamp,
+        "change_type": change_type,
+        "review_tier": tier,
+        "risk_score": risk_score,
+        "change_title": title,
+        "affected_files": files,
+        "deterministic_scan": scan_result.to_dict(),
+        "triviality": {"is_trivial": trivial, "reason": trivial_reason},
+        "cuddy_differential_diagnosis": {
+            "verdict": cuddy_finding.get("verdict", "UNAVAILABLE"),
+            "model": cuddy_finding["model"],
+            "response_length": len(cuddy_finding["response"]),
+        } if cuddy_finding else None,
+        "specialist_routing": dict(routing),
+        "specialist_results": [
+            {
+                "specialist": r["specialist_name"],
+                "model": r["model"],
+                "response_length": len(r["response"]),
+            }
+            for r in specialist_results
+        ],
+        "verdict": verdict,
+        "signed_by": "House (Gatekeeper)",
+    }
+
+    # ── Write reports ─────────────────────────────────────────────────
+    md = _build_markdown_report(review_data, cuddy_finding, scan_result, specialist_results, synthesis, house_config, board)
+    md_path.write_text(md, encoding="utf-8")
+    print(f"\n  [REPORT] {md_path}")
+
+    json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
+    print(f"  [RECORD] {json_path}")
+
+    _update_stats(review_data)
+
+    # ── VERDICT ───────────────────────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    if verdict == "APPROVED":
+        print(f"  [APPROVED] VERDICT: APPROVED")
+        print(f"  Signed: House (Gatekeeper)")
+        print(f"  Include in commit: Reviewed-by: House (Gatekeeper) <noreply@ghost-stack.ai>")
+    else:
+        print(f"  [REJECTED] VERDICT: REJECTED")
+        if blocking_findings:
+            for bf in blocking_findings:
+                print(f"  BLOCKER: {bf}")
+        print(f"  Fix the issues above and resubmit. There is no appeal.")
+    print(f"{'=' * 70}\n")
+
+    _save_dynamic_fellows()
+    return review_data
+
+
+def _build_markdown_report(review_data: dict, cuddy_finding: dict | None,
+                           scan_result,
+                           specialist_results: list[dict],
+                           synthesis: str, house_config: dict, board: dict) -> str:
+    """Build the full markdown review report."""
+    lines = [
+        f"# House Gatekeeper Review -- {review_data['change_title']}",
+        "",
+        f"**RFC ID:** {review_data['rfc_id']}",
+        f"**Date:** {review_data['timestamp']}",
+        f"**Change Type:** {review_data['change_type']}",
+        f"**Review Tier:** {review_data['review_tier']}",
+        f"**Risk Score:** {review_data['risk_score']}/5.0",
+        f"**Files Changed:** {len(review_data['affected_files'])}",
+        f"**Verdict:** {review_data['verdict']}",
+        "",
+        "---",
+        "",
+        "## Affected Files",
+        "",
+    ]
+    for f in review_data["affected_files"]:
+        lines.append(f"- `{f}`")
+
+    # ── Deterministic Pre-Scan ─────────────────────────────────────────
+    if scan_result and scan_result.total > 0:
+        lines.extend([
+            "",
+            "## 🔍 Deterministic Pre-Scan",
+            "",
+            f"**{scan_result.total} findings** in {scan_result.files_scanned} files, "
+            f"{scan_result.lines_scanned} lines ({scan_result.duration_ms}ms). "
+            f"Zero-cost pattern matching — no AI, no hallucination risk.",
+            "",
+            "| Severity | Rule | File:Line | Issue | Fix |",
+            "|----------|------|-----------|-------|-----|",
+        ])
+        for f in scan_result.findings:
+            lines.append(f"| {f.severity} | {f.rule} | {f.file}:{f.line} | {f.message} | {f.fix} |")
+        lines.append("")
+    elif scan_result:
+        lines.extend([
+            "",
+            "## 🔍 Deterministic Pre-Scan",
+            "",
+            f"**PASS** — {scan_result.files_scanned} files, {scan_result.lines_scanned} lines scanned. Clean.",
+            "",
+        ])
+
+    # ── Triviality ─────────────────────────────────────────────────────
+    trivial_info = review_data.get("triviality", {})
+    if trivial_info.get("is_trivial"):
+        lines.extend([
+            "",
+            f"> **Triviality check:** {trivial_info.get('reason', 'unknown')} — fast-track eligible.",
+            "",
+        ])
+
+    # ── Cuddy Differential Diagnosis (PRE-REVIEW) ──────────────────────
+    if cuddy_finding:
+        lines.extend([
+            "",
+            "## 🏛️ Cuddy — Differential Diagnosis (Pre-Review)",
+            "",
+            f"**Reviewer:** Dr. Lisa Cuddy, Dean of Medicine",
+            f"**Role:** Ruling out simpler alternatives before specialists touch the code",
+            f"**Model:** {cuddy_finding['model']}",
+            "",
+            "> Cuddy runs FIRST. If a simpler approach exists and wasn't ruled out, the code is the wrong approach — regardless of code quality.",
+            "",
+            cuddy_finding["response"],
+            "",
+            "---",
+        ])
+
+    lines.extend([
+        "",
+        "## Specialist Routing",
+        "",
+    ])
+    for spec_id, spec_files in review_data["specialist_routing"].items():
+        spec = next((s for s in board["specialists"] if s["id"] == spec_id), None)
+        name = spec["name"] if spec else spec_id
+        lines.append(f"- **{name}:** {len(spec_files)} file(s)")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## Specialist Findings",
+        "",
+    ])
+
+    for sr in specialist_results:
+        lines.extend([
+            f"### {sr['specialist_name']} -- via {sr['model']}",
+            "",
+            sr["response"],
+            "",
+            "---",
+            "",
+        ])
+
+    # ── Cross-Review Intelligence ────────────────────────────────────
+    from .learning import detect_recurring_problems, format_problem_alerts, format_suppression_suggestions
+    problems = detect_recurring_problems(min_occurrences=3, lookback_reviews=20)
+    prob_alerts_md = format_problem_alerts(problems)
+    supp_suggestions_md = format_suppression_suggestions()
+
+    if prob_alerts_md:
+        lines.extend([
+            "",
+            prob_alerts_md,
+            "",
+            "---",
+        ])
+    if supp_suggestions_md:
+        lines.extend([
+            "",
+            supp_suggestions_md,
+            "",
+            "---",
+        ])
+
+    lines.extend([
+        "",
+        "# House's Final Synthesis",
+        "",
+        synthesis,
+        "",
+        "---",
+        "",
+        f"**Gatekeeper:** {house_config['name']}",
+        f"**Signature:** House (Gatekeeper) <noreply@ghost-stack.ai>",
+        "",
+        "*\"Everybody lies. Code especially. This one told the truth.\"*" if review_data["verdict"] == "APPROVED" else "*\"The code lied. Fix it and come back. I'll be waiting.\"*",
+    ])
+
+    return "\n".join(lines)
+
+
+def _build_fast_track_report(review_data: dict, scan_result) -> str:
+    """Build a minimal markdown report for fast-track (trivial, no AI review)."""
+    lines = [
+        f"# House Gatekeeper Review -- {review_data['change_title']} (Fast-Track)",
+        "",
+        f"**RFC ID:** {review_data['rfc_id']}",
+        f"**Date:** {review_data['timestamp']}",
+        f"**Change Type:** {review_data['change_type']}",
+        f"**Review Tier:** FAST-TRACK (no AI review)",
+        f"**Risk Score:** {review_data['risk_score']}/5.0",
+        f"**Files Changed:** {len(review_data['affected_files'])}",
+        f"**Verdict:** APPROVED",
+        "",
+        "---",
+        "",
+        "## Why Fast-Track?",
+        "",
+        f"This diff was classified as **trivial**: {review_data.get('fast_track_reason', 'unknown')}.",
+        "",
+        "No AI review was necessary. The deterministic pre-scan found no blocking issues.",
+        "",
+        "## Affected Files",
+        "",
+    ]
+    for f in review_data["affected_files"]:
+        lines.append(f"- `{f}`")
+
+    if scan_result and scan_result.total > 0:
+        lines.extend([
+            "",
+            "## Deterministic Pre-Scan",
+            "",
+            f"**{scan_result.total} findings** — all P3/P4, no blockers.",
+            "",
+        ])
+    else:
+        lines.extend([
+            "",
+            "## Deterministic Pre-Scan",
+            "",
+            "**PASS** — clean.",
+            "",
+        ])
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "**Gatekeeper:** House (Gatekeeper)",
+        "**Signature:** House (Gatekeeper) <noreply@ghost-stack.ai>",
+        "",
+        "*\"Even I don't waste time on trivial diffs. You're welcome.\"*",
+    ])
+    return "\n".join(lines)
+
+
+# ── Onboarding ───────────────────────────────────────────────────────────────
+
+
+def run_onboarding() -> None:
+    """Interactive onboarding wizard. Asks about available API keys and configures models."""
+    print("=" * 70)
+    print("  HOUSE GATEKEEPER — Onboarding")
+    print("=" * 70)
+    print()
+    print("House needs LLM models for his review board. Each specialist gets")
+    print("a domain-optimized model. You configure what's available.")
+    print()
+
+    board = _load_json(get_review_board_path())
+
+    available_providers = {
+        "openrouter": {"name": "OpenRouter", "models": [
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-sonnet-4-6",
+            "deepseek/deepseek-v4-flash",
+            "openai/gpt-4o",
+            "google/gemini-2.5-flash",
+        ]},
+        "deepseek": {"name": "DeepSeek Direct API", "models": [
+            "deepseek-v4-flash",
+        ]},
+        "gemini": {"name": "Google Gemini API", "models": [
+            "gemini-2.5-flash",
+        ]},
+        "openai": {"name": "OpenAI API", "models": [
+            "gpt-4o",
+        ]},
+        "anthropic": {"name": "Anthropic Claude API", "models": [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ]},
+    }
+
+    print("Which LLM providers do you have API keys for?")
+    print()
+    for key, prov in available_providers.items():
+        print(f"  [{key}] {prov['name']}")
+    print()
+    print("Enter comma-separated list (e.g., 'openrouter,deepseek')")
+    print("or press Enter for OpenRouter-only (works out of the box):")
+
+    choice = input("> ").strip().lower()
+    if not choice:
+        choice = "openrouter"
+
+    selected = [c.strip() for c in choice.split(",") if c.strip() in available_providers]
+    if not selected:
+        print("No valid providers selected. Defaulting to OpenRouter.")
+        selected = ["openrouter"]
+
+    print(f"\nUsing: {', '.join(available_providers[p]['name'] for p in selected)}")
+    print()
+
+    available_models = []
+    for p in selected:
+        available_models.extend(available_providers[p]["models"])
+
+    has_opus = any("claude-opus" in m for m in available_models)
+    has_sonnet = any("claude-sonnet" in m for m in available_models)
+    has_deepseek = any("deepseek" in m for m in available_models)
+    has_gpt4o = any("gpt-4o" in m for m in available_models)
+    has_gemini = any("gemini" in m for m in available_models)
+
+    preferred_default = "anthropic/claude-opus-4-8" if has_opus else (
+        "anthropic/claude-sonnet-4-6" if has_sonnet else (
+            "deepseek/deepseek-v4-flash" if has_deepseek else available_models[0]))
+    standard_default = "deepseek/deepseek-v4-flash" if has_deepseek else (
+        "anthropic/claude-sonnet-4-6" if has_sonnet else available_models[0])
+    budget_default = "google/gemini-2.5-flash" if has_gemini else (
+        "deepseek/deepseek-v4-flash" if has_deepseek else available_models[0])
+
+    print("Auto-selected tier defaults:")
+    print(f"  Preferred (adversarial tier): {preferred_default}")
+    print(f"  Standard  (standard tier):    {standard_default}")
+    print(f"  Budget    (fast tier):        {budget_default}")
+    print()
+    print("Accept these defaults? [Y/n]: ", end="")
+    accept = input().strip().lower()
+
+    if accept and accept != "y" and accept != "yes":
+        print("\nEnter custom model ID for each slot (OpenRouter format):")
+        preferred_default = input(f"  Preferred model [{preferred_default}]: ").strip() or preferred_default
+        standard_default = input(f"  Standard model [{standard_default}]: ").strip() or standard_default
+        budget_default = input(f"  Budget model [{budget_default}]: ").strip() or budget_default
+
+    if "model_config" not in board:
+        board["model_config"] = {}
+    board["model_config"]["tier_defaults"] = {
+        "preferred": preferred_default,
+        "standard": standard_default,
+        "budget": budget_default,
+    }
+
+    print("\nPer-specialist model overrides (Enter to keep defaults, 'reset' to clear):")
+    for spec in board["specialists"]:
+        overrides = spec.get("model_overrides", {})
+        if overrides:
+            print(f"  {spec['name']}: preferred={overrides.get('preferred', 'none')}, "
+                  f"standard={overrides.get('standard', 'none')}, budget={overrides.get('budget', 'none')}")
+            resp = input(f"    Change? [Enter=keep, reset=clear, model_id=custom]: ").strip()
+            if resp == "reset":
+                spec["model_overrides"] = {"preferred": None, "standard": None, "budget": None}
+            elif resp:
+                print(f"    Enter preferred/standard/budget (comma-separated, '-' for null):")
+                parts = [p.strip() for p in input("    > ").split(",")]
+                if len(parts) >= 3:
+                    spec["model_overrides"] = {
+                        "preferred": None if parts[0] == "-" else parts[0],
+                        "standard": None if parts[1] == "-" else parts[1],
+                        "budget": None if parts[2] == "-" else parts[2],
+                    }
+
+    # Write to user config dir (so it persists and overrides the bundled default)
+    user_board_path = get_config_dir() / "review_board.json"
+    get_config_dir().mkdir(parents=True, exist_ok=True)
+    user_board_path.write_text(json.dumps(board, indent=2), encoding="utf-8")
+    print(f"\n  [OK] Configuration saved to {user_board_path}")
+    print(f"  Run: everybody-lies --tier standard")
+    print()
