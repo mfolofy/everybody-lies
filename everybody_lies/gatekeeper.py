@@ -1143,7 +1143,7 @@ def run_review(
     if verdict == "APPROVED":
         print(f"  [APPROVED] VERDICT: APPROVED")
         print(f"  Signed: House (Gatekeeper)")
-        print(f"  Include in commit: Reviewed-by: House (Gatekeeper) <noreply@ghost-stack.ai>")
+        print(f"  Include in commit: Reviewed-by: House (Gatekeeper) <noreply@everybody-lies.dev>")
     else:
         print(f"  [REJECTED] VERDICT: REJECTED")
         if blocking_findings:
@@ -1289,7 +1289,7 @@ def _build_markdown_report(review_data: dict, cuddy_finding: dict | None,
         "---",
         "",
         f"**Gatekeeper:** {house_config['name']}",
-        f"**Signature:** House (Gatekeeper) <noreply@ghost-stack.ai>",
+        f"**Signature:** House (Gatekeeper) <noreply@everybody-lies.dev>",
         "",
         "*\"Everybody lies. Code especially. This one told the truth.\"*" if review_data["verdict"] == "APPROVED" else "*\"The code lied. Fix it and come back. I'll be waiting.\"*",
     ])
@@ -1346,7 +1346,7 @@ def _build_fast_track_report(review_data: dict, scan_result) -> str:
         "---",
         "",
         "**Gatekeeper:** House (Gatekeeper)",
-        "**Signature:** House (Gatekeeper) <noreply@ghost-stack.ai>",
+        "**Signature:** House (Gatekeeper) <noreply@everybody-lies.dev>",
         "",
         "*\"Even I don't waste time on trivial diffs. You're welcome.\"*",
     ])

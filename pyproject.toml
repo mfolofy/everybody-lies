@@ -7,10 +7,9 @@ name = "everybody-lies"
 version = "0.1.0"
 description = "Code review tools ask nicely. House doesn't. Five specialists. One verdict. Fix it."
 readme = "README.md"
-license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [
-    { name = "House (Gatekeeper)", email = "noreply@ghost-stack.ai" },
+    { name = "House (Gatekeeper)" },
 ]
 keywords = [
     "code-review",
@@ -43,6 +42,9 @@ Issues = "https://github.com/mfolofy/everybody-lies/issues"
 
 [project.scripts]
 everybody-lies = "everybody_lies.cli:main"
+
+[tool.hatch.build]
+exclude = ["LICENSE"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["everybody_lies"]
