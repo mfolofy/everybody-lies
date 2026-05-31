@@ -4,6 +4,10 @@
 
 **Code review tools ask nicely. House doesn't. Five specialists. One verdict. Fix it.**
 
+<p align="center">
+  <img src="demo.gif" alt="everybody-lies demo" width="720">
+</p>
+
 ---
 
 ## What is this?
