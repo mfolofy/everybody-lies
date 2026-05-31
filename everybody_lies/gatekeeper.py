@@ -768,7 +768,8 @@ def run_review(
         auto_model = auto_detect_model()
         if available:
             provider_names = [PROVIDERS[p]["name"] for p in available]
-            print(f"  [CONFIG] Auto-detected: {auto_model} via {', '.join(provider_names)}")
+            model_info = f" ({auto_model})" if auto_model else ""
+            print(f"  [CONFIG] Auto-detected:{model_info} via {', '.join(provider_names)}")
             missing = [p for p in PROVIDERS if p not in available]
             if missing:
                 optional_names = [f"{PROVIDERS[p]['env_key']}" for p in missing]

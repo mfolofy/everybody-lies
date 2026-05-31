@@ -398,6 +398,13 @@ def _match_file_pattern(file_path: str, pattern: str) -> bool:
     """Simple glob-style file pattern matching.
 
     Supports **, *, and basic glob patterns.
+    Handles the patterns in chart.json (mostly **/*.py, *.ts, etc.).
+
+    NOTE: Complex ** patterns with multiple intermediate directories
+    may not match correctly. The patterns in chart.json use ** as a
+    simple "match everything" prefix (e.g., **/*.py) which works fine.
+    If more complex patterns are needed, switch to pathlib.PurePosixPath.match()
+    once Python 3.13+ is the minimum (it supports ** natively).
     """
     import fnmatch
     # Normalize path separators
@@ -525,7 +532,7 @@ def emit_ci_output(review_data: dict, ci_format: str, output_path: str = "") -> 
     """
     all_findings = []
 
-    # Collect scan findings
+    # Collect scan findings (deterministic — file:line precision, no false positives)
     scan = review_data.get("deterministic_scan", {})
     for f in scan.get("findings", []):
         all_findings.append({
@@ -538,24 +545,14 @@ def emit_ci_output(review_data: dict, ci_format: str, output_path: str = "") -> 
             "source": "deterministic-scan",
         })
 
-    # Collect AI findings from specialist results (simple heuristic parse)
-    for sr in review_data.get("specialist_results", []):
-        response = sr.get("response", "")
-        if not response or len(response) < 20:
-            continue
-        # Parse P1/P2 findings from specialist responses
-        for line in response.split("\n"):
-            if "**Severity:**" in line and ("P1" in line or "P2" in line):
-                # Extract what we can from the surrounding context
-                all_findings.append({
-                    "severity": "P1" if "P1" in line else "P2",
-                    "rule": sr.get("specialist", "ai-review"),
-                    "file": "",
-                    "line": 0,
-                    "message": line.strip()[:200],
-                    "fix": "See review report for details",
-                    "source": sr.get("specialist", "ai-review"),
-                })
+    # AI specialist findings are NOT parsed for CI annotations.
+    # The deterministic scan (above) provides file:line precision for CI.
+    # AI findings are unstructured text — regex-matching "**Severity:**" can
+    # match code blocks, examples, or "not a P1" → false-positive CI annotations
+    # that undermine trust. AI findings belong in the review report (markdown+JSON),
+    # where a human evaluates them in context.
+    # To add AI findings back: have specialists output a structured JSON block
+    # (e.g., ```ci-json\n[{...}]\n```) and parse that instead of free text.
 
     if ci_format == "github-actions":
         _emit_github_annotations(all_findings)

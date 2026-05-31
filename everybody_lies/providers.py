@@ -23,7 +23,7 @@ PROVIDERS = {
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
         "env_key": "DEEPSEEK_API_KEY",
-        "models": ["deepseek-v4-flash", "deepseek-reasoner"],
+        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
         "cost_note": "$0.27/$1.10 per 1M",
     },
     "openrouter": {
@@ -60,7 +60,7 @@ PROVIDERS = {
 # Order matters — first available provider wins.
 MODEL_ROUTING = {
     "deepseek-v4-flash":                ["deepseek", "openrouter"],
-    "deepseek-reasoner":                ["deepseek", "openrouter"],
+    "deepseek-v4-pro":                  ["deepseek", "openrouter"],
     "deepseek/deepseek-v4-flash":       ["openrouter"],
     "deepseek/deepseek-v4-pro":         ["openrouter"],
     "gemini-2.5-flash":                 ["gemini", "openrouter"],
@@ -87,7 +87,7 @@ DEFAULT_MODELS = {
 DEFAULT_FALLBACK = "deepseek-v4-flash"
 
 
-def auto_detect_model() -> str:
+def auto_detect_model() -> str | None:
     """Detect the best available model based on which API keys are set.
 
     Resolution order:
@@ -95,9 +95,9 @@ def auto_detect_model() -> str:
     2. DEEPSEEK_API_KEY → deepseek-v4-flash (cheapest, fastest)
     3. GEMINI_API_KEY → gemini-2.5-flash (free tier)
     4. OPENROUTER_API_KEY → anthropic/claude-sonnet-4-6
-    5. None → same error as before, user must configure
+    5. None → caller must handle (no API keys configured)
 
-    Returns a model ID resolvable by _get_provider_for_model().
+    Returns a model ID string, or None if no keys are configured.
     """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude-sonnet-4-6"
@@ -107,7 +107,7 @@ def auto_detect_model() -> str:
         return "gemini-2.5-flash"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "anthropic/claude-sonnet-4-6"
-    return ""
+    return None
 
 
 def detect_available_providers() -> list[str]:
@@ -129,40 +129,6 @@ def _get_provider_for_model(model_id: str) -> dict | None:
         if provider and os.environ.get(provider["env_key"]):
             return provider
     return PROVIDERS.get("openrouter")
-
-
-def _get_api_key_for_model(model_id: str) -> str:
-    """Resolve API key for a model.
-
-    Resolution order:
-    1. Standard provider env var (DEEPSEEK_API_KEY, GEMINI_API_KEY, etc.)
-    2. OPENROUTER_API_KEY env var
-    3. EVERYBODY_LIES_API_KEYS JSON env var  →  api_keys.OPENROUTER_API_KEY
-    """
-    provider = _get_provider_for_model(model_id)
-    if provider:
-        key = os.environ.get(provider["env_key"])
-        if key:
-            return key
-
-    # OpenRouter fallback
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if key:
-        return key
-
-    # JSON config fallback
-    json_keys = os.environ.get("EVERYBODY_LIES_API_KEYS")
-    if json_keys:
-        try:
-            parsed = json.loads(json_keys)
-            if isinstance(parsed, dict):
-                key = parsed.get("OPENROUTER_API_KEY", "")
-                if key:
-                    return key
-        except json.JSONDecodeError:
-            pass
-
-    return ""
 
 
 # ── LLM Calling ───────────────────────────────────────────────────────────────
@@ -189,12 +155,19 @@ def call_llm(
         providers_to_try.append("openrouter")
 
     last_error = None
-    for provider_key in providers_to_try:
+    for i, provider_key in enumerate(providers_to_try):
         provider = PROVIDERS.get(provider_key)
         if not provider:
             continue
 
-        key = api_key if api_key else os.environ.get(provider["env_key"], "")
+        # Only use the passed api_key for the FIRST provider in the chain.
+        # Fallback providers must use their own env vars — forwarding a
+        # provider-specific key (e.g. DeepSeek) to a different provider
+        # (e.g. Anthropic) causes 401/403 auth failures.
+        if i == 0 and api_key:
+            key = api_key
+        else:
+            key = os.environ.get(provider["env_key"], "")
         if not key and provider_key == "openrouter":
             key = os.environ.get("OPENROUTER_API_KEY", "")
             if not key:
