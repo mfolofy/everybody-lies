@@ -15,7 +15,7 @@ import argparse
 import sys
 import textwrap
 
-from .gatekeeper import run_review, run_onboarding, run_appeal
+from .gatekeeper import run_review, run_onboarding, run_appeal, run_cleanup
 
 
 def main() -> None:
@@ -63,11 +63,22 @@ def main() -> None:
     parser.add_argument("--spec-file", default="", help="Path to specific spec file for Cuddy")
     parser.add_argument("--appeal", default="", help="Appeal a REJECTED review to Wilson. Provide written justification.")
     parser.add_argument("--rfc", default="", dest="rfc_id", help="RFC ID to appeal (auto-detects latest REJECTED if omitted)")
+    parser.add_argument("--cleanup", action="store_true", help="Prune review artifacts older than --cleanup-days (default 30)")
+    parser.add_argument("--cleanup-days", type=int, default=30, help="Age threshold in days for --cleanup (default: 30)")
+    parser.add_argument("--cleanup-dry-run", action="store_true", help="Show what --cleanup would delete without deleting")
 
     args = parser.parse_args()
 
     if args.onboard:
         run_onboarding()
+        sys.exit(0)
+
+    # ── Cleanup path ──────────────────────────────────────────────────
+    if args.cleanup:
+        result = run_cleanup(days=args.cleanup_days, dry_run=args.cleanup_dry_run)
+        if args.cleanup_dry_run:
+            print(f"Would delete {result['deleted']} review artifact(s) "
+                  f"({result['freed_bytes'] / 1024:.0f} KB)")
         sys.exit(0)
 
     # ── Appeal path ───────────────────────────────────────────────────

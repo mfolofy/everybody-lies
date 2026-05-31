@@ -594,6 +594,105 @@ def _build_output_paths(title: str) -> tuple[Path, Path]:
     return md_path, json_path
 
 
+def _cleanup_old_rounds(current_md: Path, current_json: Path,
+                        title: str, date_str: str) -> int:
+    """Delete previous rounds of the same review. Keeps only the latest.
+
+    When House rejects a change and the agent fixes + resubmits, multiple
+    review rounds accumulate (house-...-slug.md, house-...-slug-r1.md, ...).
+    Only the latest round is relevant — old rounds are in git history.
+
+    Returns the number of files deleted.
+    """
+    reviews_dir = get_reviews_dir()
+    slug = title.lower().replace(" ", "-").replace("/", "-")
+    slug = re.sub(r'[<>:"|?*\\]', '', slug)
+    slug = re.sub(r'-+', '-', slug)
+    slug = slug.strip("-.")[:60]
+    if not slug:
+        return 0
+
+    # Find all files matching this review's base slug
+    prefix = f"house-{date_str}-{slug}"
+    deleted = 0
+
+    for f in sorted(reviews_dir.glob(f"{prefix}*")):
+        if f == current_md or f == current_json:
+            continue  # keep the current round
+        try:
+            f.unlink()
+            deleted += 1
+        except OSError:
+            pass
+
+    return deleted
+
+
+def run_cleanup(days: int = 30, dry_run: bool = False) -> dict:
+    """Prune review artifacts older than N days.
+
+    Deletes both .md and .json review files. The audit trail
+    remains in git history for committed reviews.
+
+    Returns a dict with cleanup statistics.
+    """
+    reviews_dir = get_reviews_dir()
+    if not reviews_dir.exists():
+        return {"deleted": 0, "freed_bytes": 0, "dry_run": dry_run}
+
+    cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
+    deleted = 0
+    freed = 0
+
+    for pattern in ("house-*.md", "house-*.json"):
+        for f in reviews_dir.glob(pattern):
+            if f.stat().st_mtime < cutoff:
+                size = f.stat().st_size
+                if not dry_run:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        continue
+                deleted += 1
+                freed += size
+
+    if not dry_run and deleted > 0:
+        print(f"\n  [CLEANUP] Pruned {deleted} review artifact(s) older than {days} days "
+              f"({freed / 1024:.0f} KB freed)")
+        # Also prune empty stats entries older than cutoff
+        _prune_stats(cutoff)
+
+    return {"deleted": deleted, "freed_bytes": freed, "dry_run": dry_run}
+
+
+def _prune_stats(cutoff_timestamp: float) -> None:
+    """Remove stats entries older than cutoff."""
+    stats_path = get_stats_path()
+    if not stats_path.exists():
+        return
+    try:
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        reviews = stats.get("reviews", [])
+        kept = []
+        pruned = 0
+        for r in reviews:
+            ts = r.get("timestamp", "")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if dt.timestamp() < cutoff_timestamp:
+                        pruned += 1
+                        continue
+                except (ValueError, OSError):
+                    pass
+            kept.append(r)
+        if pruned > 0:
+            stats["reviews"] = kept
+            stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _update_stats(review_data: dict) -> None:
     """Update review statistics."""
     stats_path = get_stats_path()
@@ -848,6 +947,8 @@ def run_review(
             }
             md_path.write_text(_build_fast_track_report(review_data, scan_result), encoding="utf-8")
             json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
+            _cleanup_old_rounds(md_path, json_path, title,
+                               datetime.now(timezone.utc).strftime("%Y-%m-%d"))
             print(f"  [REPORT] {md_path}")
             print(f"\n{'=' * 70}")
             print(f"  [APPROVED] VERDICT: APPROVED (Fast-Track)")
@@ -1137,6 +1238,12 @@ def run_review(
 
     json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
     print(f"  [RECORD] {json_path}")
+
+    # Clean up previous rounds of this same review (keep only the latest)
+    cleaned = _cleanup_old_rounds(md_path, json_path, title,
+                                  datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    if cleaned > 0:
+        print(f"  [CLEANUP] Removed {cleaned} obsolete review round(s)")
 
     _update_stats(review_data)
 
