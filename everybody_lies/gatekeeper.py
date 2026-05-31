@@ -1195,35 +1195,39 @@ def _find_latest_rejected_review() -> Path | None:
     return None
 
 
-def _get_appeal_model(board: dict) -> str:
+def _get_appeal_model(board: dict) -> str | None:
     """Resolve the model for Wilson (appeal judge).
 
-    MUST be a different model/provider than the review board uses.
-    All specialists use DeepSeek V4 Flash, so Wilson defaults to Gemini
+    MUST be a different PROVIDER than the review board uses.
+    All specialists use DeepSeek direct API, so Wilson defaults to Gemini
     via OpenRouter (different provider, different training).
+
+    DeepSeek models are EXCLUDED from fallbacks — if no distinct provider
+    is available, returns None (appeal cannot proceed without an
+    independent judge).
 
     Falls back through the appeal_judge.fallback_models list.
     """
     appeal_config = board.get("appeal_judge", {})
     primary = appeal_config.get("model", "google/gemini-2.5-flash")
-    fallbacks = appeal_config.get("fallback_models", ["deepseek-v4-pro", "deepseek-v4-flash"])
+    fallbacks = appeal_config.get("fallback_models",
+        ["anthropic/claude-sonnet-4-6", "openai/gpt-4o"])
 
-    # Try primary first
+    # Try primary first, then fallbacks
     providers_to_try = [primary] + fallbacks
     for model in providers_to_try:
         try:
-            # Check if this model's provider is available
             from .providers import MODEL_ROUTING, PROVIDERS
             route = MODEL_ROUTING.get(model, ["openrouter"])
             for provider_key in route:
                 provider = PROVIDERS.get(provider_key)
-                if provider and os.environ.get(provider["env_key"]):
+                if provider and provider_key != "deepseek" and os.environ.get(provider["env_key"]):
                     return model
         except Exception:
             continue
 
-    # Ultimate fallback
-    return "deepseek-v4-flash"
+    # No independent judge available — appeal cannot proceed
+    return None
 
 
 def _has_p1_findings(review_data: dict) -> bool:
@@ -1342,6 +1346,29 @@ def run_appeal(rfc_id: str = "", justification: str = "",
 
     wilson_name = appeal_config.get("name", "Dr. James Wilson")
     wilson_title = appeal_config.get("title", "Appeal Judge")
+
+    if model is None:
+        print(f"\n{'=' * 70}")
+        print(f"  APPEAL DEFERRED — No independent judge available")
+        print(f"  RFC: {rfc_id}")
+        print(f"  Wilson requires a different provider than the review board.")
+        print(f"  No Gemini, Anthropic, or OpenAI key detected.")
+        print(f"  Appeal cannot proceed without genuine separation of powers.")
+        print(f"  Fix the findings or set an API key for a non-DeepSeek provider.")
+        print(f"{'=' * 70}\n")
+
+        appeal_data = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "rfc_id": rfc_id,
+            "justification": justification,
+            "appeal_model": "DEFERRED (no independent judge available)",
+            "appeal_judge": f"{wilson_name} ({wilson_title})",
+            "original_verdict": original_verdict,
+            "appeal_verdict": "DEFERRED",
+            "reason": "No non-DeepSeek provider available. Separation of powers requires a different provider.",
+        }
+        _log_appeal(appeal_data)
+        return appeal_data
 
     print(f"\n{'=' * 70}")
     print(f"  APPEAL TO WILSON")
