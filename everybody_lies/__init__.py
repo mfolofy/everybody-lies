@@ -5,5 +5,5 @@ Code review tools ask nicely. House doesn't.
 Five specialists. One verdict. Fix it.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "House (Gatekeeper)"
