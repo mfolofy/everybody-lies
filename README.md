@@ -188,6 +188,8 @@ The deterministic scan caught the security issues in 1.75ms. Cuddy caught the ap
 
 ```bash
 pip install everybody-lies
+# or, from GitHub Releases:
+pip install https://github.com/mfolofy/everybody-lies/releases/download/v0.2.0/everybody_lies-0.2.0-py3-none-any.whl
 ```
 
 **If you're a Claude Code user:** Your `ANTHROPIC_API_KEY` is already in your environment. The tool auto-detects it. Zero configuration.
