@@ -15,7 +15,7 @@ import argparse
 import sys
 import textwrap
 
-from .gatekeeper import run_review, run_onboarding
+from .gatekeeper import run_review, run_onboarding, run_appeal
 
 
 def main() -> None:
@@ -61,12 +61,26 @@ def main() -> None:
     parser.add_argument("--spec", action="store_true", default=False,
                         help="Auto-detect and use SPEC.md/*.feature files for Cuddy's differential diagnosis")
     parser.add_argument("--spec-file", default="", help="Path to specific spec file for Cuddy")
+    parser.add_argument("--appeal", default="", help="Appeal a REJECTED review to Wilson. Provide written justification.")
+    parser.add_argument("--rfc", default="", dest="rfc_id", help="RFC ID to appeal (auto-detects latest REJECTED if omitted)")
 
     args = parser.parse_args()
 
     if args.onboard:
         run_onboarding()
         sys.exit(0)
+
+    # ── Appeal path ───────────────────────────────────────────────────
+    if args.appeal:
+        result = run_appeal(
+            rfc_id=args.rfc_id,
+            justification=args.appeal,
+        )
+        verdict = result.get("appeal_verdict", "DENIED")
+        if verdict in ("GRANTED", "PARTIAL"):
+            sys.exit(0)
+        else:
+            sys.exit(1)
 
     files = None
     if args.files:

@@ -53,6 +53,11 @@ def get_dynamic_fellows_path() -> Path:
     return get_config_dir() / "dynamic_fellows.json"
 
 
+def get_appeals_log_path() -> Path:
+    """Path to appeals.jsonl — audit log of all bypass appeals."""
+    return get_reviews_dir() / "appeals.jsonl"
+
+
 def ensure_config_dir() -> Path:
     """Create config directory if it doesn't exist. Returns the path."""
     path = get_config_dir()

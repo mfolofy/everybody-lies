@@ -24,6 +24,7 @@ from .config import (
     get_reviews_dir,
     get_stats_path,
     get_dynamic_fellows_path,
+    get_appeals_log_path,
     ensure_config_dir,
 )
 from .providers import (
@@ -1150,11 +1151,390 @@ def run_review(
         if blocking_findings:
             for bf in blocking_findings:
                 print(f"  BLOCKER: {bf}")
-        print(f"  Fix the issues above and resubmit. There is no appeal.")
+        has_p1 = any("P1" in bf for bf in blocking_findings)
+        if has_p1:
+            print(f"  P1 findings — not appealable. Fix them. Not even Wilson can help you.")
+        else:
+            print(f"  No P1 findings — may appeal to Wilson: everybody-lies --appeal \"justification\" --rfc {review_data.get('rfc_id', 'RFC-unknown')}")
     print(f"{'=' * 70}\n")
 
     _save_dynamic_fellows()
     return review_data
+
+
+# ── Appeal Pipeline ──────────────────────────────────────────────────────────
+
+
+def _find_review_by_rfc(rfc_id: str) -> Path | None:
+    """Find a review JSON file by RFC ID."""
+    reviews_dir = get_reviews_dir()
+    if not reviews_dir.exists():
+        return None
+    for json_file in sorted(reviews_dir.glob("house-*.json"), reverse=True):
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+            if data.get("rfc_id") == rfc_id:
+                return json_file
+        except Exception:
+            continue
+    return None
+
+
+def _find_latest_rejected_review() -> Path | None:
+    """Find the most recent REJECTED review JSON."""
+    reviews_dir = get_reviews_dir()
+    if not reviews_dir.exists():
+        return None
+    for json_file in sorted(reviews_dir.glob("house-*.json"), reverse=True):
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+            if data.get("verdict") == "REJECTED":
+                return json_file
+        except Exception:
+            continue
+    return None
+
+
+def _get_appeal_model(board: dict) -> str:
+    """Resolve the model for Wilson (appeal judge).
+
+    MUST be a different model/provider than the review board uses.
+    All specialists use DeepSeek V4 Flash, so Wilson defaults to Gemini
+    via OpenRouter (different provider, different training).
+
+    Falls back through the appeal_judge.fallback_models list.
+    """
+    appeal_config = board.get("appeal_judge", {})
+    primary = appeal_config.get("model", "google/gemini-2.5-flash")
+    fallbacks = appeal_config.get("fallback_models", ["deepseek-v4-pro", "deepseek-v4-flash"])
+
+    # Try primary first
+    providers_to_try = [primary] + fallbacks
+    for model in providers_to_try:
+        try:
+            # Check if this model's provider is available
+            from .providers import MODEL_ROUTING, PROVIDERS
+            route = MODEL_ROUTING.get(model, ["openrouter"])
+            for provider_key in route:
+                provider = PROVIDERS.get(provider_key)
+                if provider and os.environ.get(provider["env_key"]):
+                    return model
+        except Exception:
+            continue
+
+    # Ultimate fallback
+    return "deepseek-v4-flash"
+
+
+def _has_p1_findings(review_data: dict) -> bool:
+    """Check if the review has any P1 (non-appealable) findings."""
+    # Check specialist results for P1 patterns
+    for sr in review_data.get("specialist_results", []):
+        # specialist_results in the JSON only has summary (specialist, model, response_length)
+        # We need to check the full markdown report for P1s
+        pass
+
+    # Check the deterministic scan
+    scan = review_data.get("deterministic_scan", {})
+    if scan.get("p1_count", 0) > 0:
+        return True
+
+    # Check cuddy findings
+    cuddy = review_data.get("cuddy_differential_diagnosis", {})
+    if cuddy and cuddy.get("verdict") == "FAIL":
+        return True
+
+    return False
+
+
+def _load_full_review_markdown(rfc_id: str) -> str:
+    """Load the full markdown report for an RFC."""
+    review_json = _find_review_by_rfc(rfc_id)
+    if not review_json:
+        return ""
+
+    # The markdown file has the same stem
+    md_path = review_json.with_suffix(".md")
+    if md_path.exists():
+        return md_path.read_text(encoding="utf-8")[:8000]  # first 8K chars
+    return ""
+
+
+def run_appeal(rfc_id: str = "", justification: str = "",
+               model: str = "") -> dict:
+    """Appeal a REJECTED House review to Dr. James Wilson.
+
+    Wilson is House's best friend and the ONLY person House trusts to
+    tell him he's wrong. He reviews the original findings and the agent's
+    justification. He can overrule House's rejection.
+
+    Rules:
+    - P1 findings CANNOT be appealed (hard block — automatic denial)
+    - P2 findings can be appealed with written justification
+    - Wilson uses a DIFFERENT model/provider than the review board
+    - All appeals are logged to docs/reviews/appeals.jsonl
+    - If appeal is denied, the agent MUST fix the findings
+
+    Returns a dict with the appeal verdict and reasoning.
+    """
+    board = _load_json(get_chart_path())
+    appeal_config = board.get("appeal_judge", {})
+
+    # ── Find the review ───────────────────────────────────────────────
+    review_json_path = None
+    if rfc_id:
+        review_json_path = _find_review_by_rfc(rfc_id)
+        if not review_json_path:
+            print(f"ERROR: No review found with RFC ID '{rfc_id}'.", file=sys.stderr)
+            print("       Check docs/reviews/ for valid RFC IDs.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        review_json_path = _find_latest_rejected_review()
+        if not review_json_path:
+            print("ERROR: No REJECTED reviews found to appeal.", file=sys.stderr)
+            sys.exit(1)
+
+    review_data = _load_json(review_json_path)
+    rfc_id = review_data.get("rfc_id", review_json_path.stem.replace("house-", "RFC-"))
+    original_verdict = review_data.get("verdict", "UNKNOWN")
+
+    if original_verdict != "REJECTED":
+        print(f"ERROR: Review {rfc_id} was {original_verdict}, not REJECTED.", file=sys.stderr)
+        print("       Only REJECTED reviews can be appealed.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Check for P1 findings (automatic denial) ──────────────────────
+    review_md = _load_full_review_markdown(rfc_id)
+
+    # Scan for P1 findings in the markdown report
+    p1_pattern = re.compile(r'^\s*[-|]\s*(?:\[)?P1(?:\])?\s*[|:]', re.IGNORECASE | re.MULTILINE)
+    has_p1_in_md = bool(p1_pattern.search(review_md))
+
+    # Also check the deterministic scan
+    scan = review_data.get("deterministic_scan", {})
+    has_p1_scan = scan.get("p1_count", 0) > 0
+
+    if has_p1_in_md or has_p1_scan:
+        print(f"\n{'=' * 70}")
+        print(f"  APPEAL AUTOMATICALLY DENIED — P1 findings are not appealable")
+        print(f"  RFC: {rfc_id}")
+        print(f"  P1 in scan: {has_p1_scan}")
+        print(f"  P1 in report: {has_p1_in_md}")
+        print(f"  Fix the P1 findings and resubmit. Not even Wilson can overturn P1s.")
+        print(f"{'=' * 70}\n")
+
+        appeal_data = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "rfc_id": rfc_id,
+            "justification": justification,
+            "appeal_model": "N/A (auto-denied — P1 findings)",
+            "original_verdict": original_verdict,
+            "appeal_verdict": "AUTO_DENIED",
+            "reason": "P1 findings are not appealable by policy.",
+            "wilson_quote": "I can't help you. Even I can't overturn a P1. Fix it.",
+        }
+        _log_appeal(appeal_data)
+        return appeal_data
+
+    # ── Run Wilson ────────────────────────────────────────────────────
+    if not model:
+        model = _get_appeal_model(board)
+
+    wilson_name = appeal_config.get("name", "Dr. James Wilson")
+    wilson_title = appeal_config.get("title", "Appeal Judge")
+
+    print(f"\n{'=' * 70}")
+    print(f"  APPEAL TO WILSON")
+    print(f"  RFC: {rfc_id}")
+    print(f"  Original verdict: {original_verdict}")
+    print(f"  Appeal judge: {wilson_name} ({wilson_title})")
+    print(f"  Model: {model}")
+    print(f"  Justification: {justification[:200]}{'...' if len(justification) > 200 else ''}")
+    print(f"{'=' * 70}\n")
+
+    # Build Wilson's prompt
+    system = textwrap.dedent(f"""\
+        You are {wilson_name}, {wilson_title}. You are House's best friend —
+        his ONLY friend — and the sole person on this planet whose judgment
+        he actually trusts.
+
+        {appeal_config.get('review_prompt', '')}""")
+
+    user = textwrap.dedent(f"""\
+        ## Original House Review ({rfc_id})
+
+        {review_md}
+
+        ---
+
+        ## Agent's Appeal Justification
+
+        {justification}
+
+        ---
+
+        ## Your Task
+
+        Review the original findings and the agent's justification.
+        Issue your verdict: OVERRULED, UPHELD, or PARTIAL.
+
+        Structure your response as:
+
+        ## Wilson's Appeal Verdict: OVERRULED / UPHELD / PARTIAL
+
+        ## Analysis
+        (For each finding the agent is appealing, analyze the justification)
+
+        ## Individual Rulings
+        - Finding #1: [OVERRULED / UPHELD] — [reasoning]
+        - Finding #2: [OVERRULED / UPHELD] — [reasoning]
+        ...
+
+        ## Summary
+        - Findings overruled: N
+        - Findings upheld: N
+        - Agent must still fix: [list]
+
+        ## Wilson's Final Word
+        (One sentence to House. Be honest. If he was right, say so. If he was being
+        dramatic, tell him to get off his high horse.)
+        """)
+
+    print(f"  [WILSON] Evaluating appeal...")
+    try:
+        response = call_llm(model, system, user, max_tokens=4096, temperature=0.4)
+        print(f"    -> {len(response)} chars received")
+    except Exception as exc:
+        print(f"    -> Wilson unavailable: {exc}")
+        response = (f"**ERROR:** Wilson unavailable for appeal. {exc}\n\n"
+                     f"Appeal cannot be processed. Fix the original findings or try again later.")
+
+    # ── Parse Wilson's verdict ────────────────────────────────────────
+    # Wilson uses GRANTED/DENIED (not the ambiguous OVERRULED/UPHELD)
+    response_upper = response.upper()
+    if "APPEAL GRANTED" in response_upper[:300] and "PARTIAL" not in response_upper[:300]:
+        appeal_verdict = "GRANTED"
+    elif "APPEAL DENIED" in response_upper[:300]:
+        appeal_verdict = "DENIED"
+    elif "PARTIAL" in response_upper[:300]:
+        appeal_verdict = "PARTIAL"
+    elif "GRANTED" in response_upper[:300]:
+        # Fallback: "GRANTED" without "APPEAL" prefix
+        appeal_verdict = "GRANTED"
+    else:
+        appeal_verdict = "DENIED"  # default to denied (safe)
+
+    # ── Build output ──────────────────────────────────────────────────
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    appeal_data = {
+        "timestamp": timestamp,
+        "rfc_id": rfc_id,
+        "justification": justification,
+        "appeal_model": model,
+        "appeal_judge": f"{wilson_name} ({wilson_title})",
+        "original_verdict": original_verdict,
+        "appeal_verdict": appeal_verdict,
+        "wilson_response": response,
+    }
+
+    _log_appeal(appeal_data)
+
+    # Also update the original review JSON with appeal info
+    review_data["appeal"] = {
+        "timestamp": timestamp,
+        "verdict": appeal_verdict,
+        "justification": justification,
+        "model": model,
+        "judge": f"{wilson_name} ({wilson_title})",
+    }
+    review_json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
+
+    # ── Print verdict ─────────────────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    if appeal_verdict == "GRANTED":
+        print(f"  [APPEAL GRANTED] Wilson granted the appeal.")
+        print(f"  House was wrong. The agent may proceed with the commit.")
+        print(f"  Wilson: \"{_extract_wilson_quote(response)}\"")
+    elif appeal_verdict == "PARTIAL":
+        print(f"  [PARTIAL GRANT] Wilson partially granted the appeal.")
+        print(f"  Some findings granted, some denied.")
+        print(f"  Agent must fix the denied findings before committing.")
+        print(f"  Wilson: \"{_extract_wilson_quote(response)}\"")
+    else:
+        print(f"  [APPEAL DENIED] Wilson denied the appeal.")
+        print(f"  House was right. The agent MUST fix the findings and resubmit.")
+        print(f"  There is no further appeal. Fix the code.")
+        print(f"  Wilson: \"{_extract_wilson_quote(response)}\"")
+    print(f"  Appeal logged to appeals.jsonl")
+    print(f"{'=' * 70}\n")
+
+    return appeal_data
+
+
+def _extract_wilson_quote(response: str) -> str:
+    """Extract Wilson's final word from the response."""
+    for marker in ["## Wilson's Final Word", "## Final Word", "**Wilson's Final Word**"]:
+        if marker in response:
+            section = response.split(marker)[1]
+            lines = section.strip().split("\n")
+            # Take first non-empty line
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    return stripped[:200]
+    # Fallback: last meaningful line
+    lines = [l.strip() for l in response.split("\n") if l.strip() and not l.startswith("#")]
+    return lines[-1][:200] if lines else "I've said my piece."
+
+
+def _log_appeal(appeal_data: dict) -> None:
+    """Append an appeal record to appeals.jsonl."""
+    log_path = get_appeals_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(appeal_data, ensure_ascii=False) + "\n")
+
+
+def _get_appeal_summary() -> str:
+    """Get a summary of recent appeals for the House recap."""
+    log_path = get_appeals_log_path()
+    if not log_path.exists():
+        return ""
+
+    appeals = []
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        appeals.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except Exception:
+        return ""
+
+    if not appeals:
+        return ""
+
+    # Only show today's appeals
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    todays = [a for a in appeals if a.get("timestamp", "").startswith(today)]
+
+    if not todays:
+        return ""
+
+    lines = ["", "## ⚖️ Appeals (Wilson)", ""]
+    for a in todays:
+        rfc = a.get("rfc_id", "unknown")
+        verdict = a.get("appeal_verdict", "UNKNOWN")
+        justification = a.get("justification", "")[:100]
+        emoji = {"GRANTED": "🟢", "PARTIAL": "🟡", "DENIED": "🔴", "AUTO_DENIED": "⛔"}.get(verdict, "❓")
+        lines.append(f"- {emoji} **{rfc}**: {verdict} — {justification}")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def _build_markdown_report(review_data: dict, cuddy_finding: dict | None,
