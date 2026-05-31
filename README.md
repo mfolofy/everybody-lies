@@ -271,7 +271,7 @@ House is **provider-agnostic.** Any model, any API, any endpoint. The tool ships
 | Provider | Example models | Auth |
 |----------|---------------|------|
 | **Anthropic Direct** | claude-sonnet-4-6, claude-opus-4-8, claude-haiku-4-5 | `ANTHROPIC_API_KEY` |
-| **DeepSeek Direct** | deepseek-v4-flash, deepseek-reasoner | `DEEPSEEK_API_KEY` |
+| **DeepSeek Direct** | deepseek-v4-flash, deepseek-v4-pro | `DEEPSEEK_API_KEY` |
 | **Gemini Direct** | gemini-2.5-flash, gemini-2.5-pro, gemini-3.5-flash | `GEMINI_API_KEY` |
 | **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek, …) | `OPENROUTER_API_KEY` |
 
