@@ -78,7 +78,7 @@ MODEL_ROUTING = {
     "claude-haiku-4-5":                 ["anthropic", "openrouter"],
 }
 
-# Default models used when review_board.json has no model_config.
+# Default models used when chart.json has no model_config.
 # These are overridden by auto_detect_model() when API keys are detected.
 DEFAULT_MODELS = {
     "preferred": "deepseek-v4-flash",

@@ -20,7 +20,7 @@ from typing import Optional
 
 from .config import (
     get_config_dir,
-    get_review_board_path,
+    get_chart_path,
     get_reviews_dir,
     get_stats_path,
     get_dynamic_fellows_path,
@@ -697,7 +697,7 @@ def run_review(
     # Ensure config directory exists
     ensure_config_dir()
 
-    board = _load_json(get_review_board_path())
+    board = _load_json(get_chart_path())
     house_config = board["gatekeeper"]
     static_specialists = board.get("specialists", [])
 
@@ -1366,7 +1366,7 @@ def run_onboarding() -> None:
     print("a domain-optimized model. You configure what's available.")
     print()
 
-    board = _load_json(get_review_board_path())
+    board = _load_json(get_chart_path())
 
     available_providers = {
         "openrouter": {"name": "OpenRouter", "models": [
@@ -1471,7 +1471,7 @@ def run_onboarding() -> None:
                     }
 
     # Write to user config dir (so it persists and overrides the bundled default)
-    user_board_path = get_config_dir() / "review_board.json"
+    user_board_path = get_config_dir() / "chart.json"
     get_config_dir().mkdir(parents=True, exist_ok=True)
     user_board_path.write_text(json.dumps(board, indent=2), encoding="utf-8")
     print(f"\n  [OK] Configuration saved to {user_board_path}")

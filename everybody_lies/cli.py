@@ -2,6 +2,7 @@
 
 Usage:
     everybody-lies --tier fast                    # Review unstaged changes, fast tier
+    everybody-lies diagnose --staged               # Same thing, House MD themed
     everybody-lies --staged --tier standard       # Review staged changes
     everybody-lies --diff "$(git diff)"           # Review a specific diff
     everybody-lies --tier standard --dry-run      # Generate prompts only
@@ -25,6 +26,7 @@ def main() -> None:
         epilog=textwrap.dedent("""\
             Examples:
               %(prog)s --tier fast                                          # Review unstaged changes, fast tier
+              %(prog)s diagnose --staged --tier fast                        # Same thing, House MD themed
               %(prog)s --staged --tier standard                             # Review staged changes
               %(prog)s --diff "$(git diff main...HEAD)" --tier adversarial   # Review branch diff
               %(prog)s --files "src/auth.py,frontend/Login.tsx" --tier fast  # Review specific files
@@ -36,6 +38,10 @@ def main() -> None:
               %(prog)s --spec                                               # Use SPEC.md for Cuddy's differential
         """),
     )
+    # "diagnose" positional — a pure aesthetic alias. House doesn't "review" code, he diagnoses it.
+    parser.add_argument("command", nargs="?", default="review",
+                        choices=["diagnose", "review"],
+                        help=argparse.SUPPRESS)
     parser.add_argument("--tier", choices=["fast", "standard", "adversarial"],
                         default="standard", help="Review tier (default: standard)")
     parser.add_argument("--diff", default="", help="Git diff text to review")

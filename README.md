@@ -14,6 +14,7 @@ Your AI wrote it. It's wrong. House proves exactly why.
 
 ```
 $ everybody-lies --staged --tier fast
+$ everybody-lies diagnose --staged           # Same thing, House MD themed
 ```
 
 ## The Pipeline
@@ -76,6 +77,7 @@ You (Human)
 ```bash
 # Standalone CLI — any terminal, any machine
 everybody-lies --staged --tier standard
+everybody-lies diagnose --staged             # House doesn't "review" — he diagnoses
 
 # Pre-commit hook — blocks commits without House's signature
 # .git/hooks/pre-commit
@@ -216,6 +218,7 @@ Then review away:
 ```bash
 # Review staged changes
 everybody-lies --staged --tier standard
+everybody-lies diagnose --staged             # House doesn't "review" — he diagnoses
 
 # Review everything
 everybody-lies --tier fast
@@ -296,7 +299,7 @@ House stores everything in `~/.everybody-lies/`:
 
 ```
 ~/.everybody-lies/
-├── review_board.json      # Your specialist config (from --onboard)
+├── chart.json             # Your specialist config (from --onboard)
 ├── reviews/               # Review reports (RFC archive)
 │   ├── house-2026-05-30-fix-auth-race.md
 │   └── house-2026-05-30-fix-auth-race.json

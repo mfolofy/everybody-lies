@@ -19,19 +19,23 @@ def get_config_dir() -> Path:
     return Path.home() / ".everybody-lies"
 
 
-def get_review_board_path() -> Path:
-    """Resolve review_board.json path.
+def get_chart_path() -> Path:
+    """Resolve chart.json path.
 
-    1. $EVERYBODY_LIES_REVIEW_BOARD   — explicit path
-    2. <config_dir>/review_board.json — user override
+    1. $EVERYBODY_LIES_CHART          — explicit path
+    2. <config_dir>/chart.json        — user override
     3. Bundled with package            — default
     """
-    if env_path := os.environ.get("EVERYBODY_LIES_REVIEW_BOARD"):
+    if env_path := os.environ.get("EVERYBODY_LIES_CHART"):
         return Path(env_path)
-    user_path = get_config_dir() / "review_board.json"
+    user_path = get_config_dir() / "chart.json"
     if user_path.exists():
         return user_path
-    return Path(__file__).resolve().parent / "review_board.json"
+    return Path(__file__).resolve().parent / "chart.json"
+
+
+# Backward compatibility alias — original name still works
+get_review_board_path = get_chart_path
 
 
 def get_reviews_dir() -> Path:
