@@ -14,23 +14,44 @@ from .config import get_config_dir
 
 
 # ── Key Bootstrap ─────────────────────────────────────────────────────────────
-# If EVERYBODY_LIES_API_KEYS is set (a JSON blob), populate any missing env vars
-# from it at import time. This allows callers (hooks, CLIs, wrappers) to pass
-# all API keys in one environment variable without coupling to secrets.json layout.
-# Only sets keys that are not already present in the environment.
-_JSON_KEYS = os.environ.get("EVERYBODY_LIES_API_KEYS")
-if _JSON_KEYS:
-    try:
-        _KNOWN_VARS = {
-            "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
-            "GEMINI_API_KEY", "ANTHROPIC_API_KEY",
-        }
-        _parsed = json.loads(_JSON_KEYS)
-        for _var in _KNOWN_VARS:
-            if _parsed.get(_var) and not os.environ.get(_var):
-                os.environ[_var] = _parsed[_var]
-    except (json.JSONDecodeError, TypeError):
-        pass
+# Populate missing API key env vars from two optional sources at import time.
+# Never overwrites keys already set. Fails silently — House works without it.
+#
+# Source 1: EVERYBODY_LIES_API_KEYS — a JSON blob of {VAR_NAME: key_value}.
+#   Lets hooks/wrappers pass all keys in one env var.
+#
+# Source 2: EVERYBODY_LIES_SECRETS_FILE — path to a flat JSON file of
+#   {VAR_NAME: key_value}. Lets standalone CLI users point at their secrets.
+#
+_KNOWN_VARS = {
+    "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY", "ANTHROPIC_API_KEY",
+}
+
+def _bootstrap_keys() -> None:
+    # Source 1: JSON blob in env
+    _json_keys = os.environ.get("EVERYBODY_LIES_API_KEYS")
+    if _json_keys:
+        try:
+            _parsed = json.loads(_json_keys)
+            for _var in _KNOWN_VARS:
+                if _parsed.get(_var) and not os.environ.get(_var):
+                    os.environ[_var] = str(_parsed[_var])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Source 2: secrets file pointed to by env var
+    _secrets_path = os.environ.get("EVERYBODY_LIES_SECRETS_FILE")
+    if _secrets_path:
+        try:
+            _data = json.loads(open(_secrets_path, encoding="utf-8").read())
+            for _var in _KNOWN_VARS:
+                if _data.get(_var) and not os.environ.get(_var):
+                    os.environ[_var] = str(_data[_var])
+        except Exception:
+            pass
+
+_bootstrap_keys()
 
 
 # ── Provider Definitions ──────────────────────────────────────────────────────
