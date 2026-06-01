@@ -171,7 +171,7 @@ PATTERNS = [
         r"(?i)(?:(?:host|server|endpoint|url|base_url)\s*[:=]\s*['\"]https?://(?!localhost|127\.0\.0\.1)[^'\"]+['\"]|"
         r"(?:host|server)\s*[:=]\s*['\"]\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}['\"])",
         "Hardcoded hostname or IP address — should be configurable",
-        "Externalize to environment variable or config file.",
+        "Externalize to environment variable or config file. If behind os.getenv(), this is a false positive.",
         None,
     ),
     (
@@ -193,7 +193,7 @@ PATTERNS = [
     (
         "http-not-https",
         "P2",
-        r"(?i)https?://(?!localhost|127\.0\.0\.1|0\.0\.0\.0)[^\s'\"]+",
+        r"(?i)http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0)[^\s'\"]+",
         "HTTP URL detected (not HTTPS) — potential insecure communication",
         "Use HTTPS for all external communication. HTTP is acceptable for localhost only.",
         None,
@@ -365,6 +365,13 @@ def scan_diff(diff_text: str, files: Optional[list[str]] = None) -> ScanResult:
             # Run the regex
             match = re.search(pattern, entry_text)
             if not match:
+                continue
+
+            # Suppress hardcoded-ip-hostname when the URL is a configurable
+            # default behind an env var — the hostname is not actually hardcoded.
+            if rule_name == "hardcoded-ip-hostname" and re.search(
+                r"(?:os\.getenv|os\.environ|environ\.get)", entry_text
+            ):
                 continue
 
             # Dedup
