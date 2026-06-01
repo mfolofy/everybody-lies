@@ -160,18 +160,6 @@ def detect_available_providers() -> list[str]:
     return available
 
 
-# ── Key Resolution ────────────────────────────────────────────────────────────
-
-def _get_provider_for_model(model_id: str) -> dict | None:
-    """Find the first available provider for a model. Returns provider dict or None."""
-    providers_to_try = MODEL_ROUTING.get(model_id, ["openrouter"])
-    for provider_key in providers_to_try:
-        provider = PROVIDERS.get(provider_key)
-        if provider and os.environ.get(provider["env_key"]):
-            return provider
-    return PROVIDERS.get("openrouter")
-
-
 # ── LLM Calling ───────────────────────────────────────────────────────────────
 
 def call_llm(

@@ -616,7 +616,16 @@ def _cleanup_old_rounds(current_md: Path, current_json: Path,
     prefix = f"house-{date_str}-{slug}"
     deleted = 0
 
-    for f in sorted(reviews_dir.glob(f"{prefix}*")):
+    # Use exact prefix + round suffix pattern to avoid matching reviews
+    # whose slugs share a prefix (e.g. "auth" matching "auth-flow" files).
+    # Round files are named: {prefix}.md, {prefix}.json, {prefix}-r1.md, {prefix}-r1.json, etc.
+    _round_files = (
+        list(reviews_dir.glob(f"{prefix}.md")) +
+        list(reviews_dir.glob(f"{prefix}.json")) +
+        list(reviews_dir.glob(f"{prefix}-r*.md")) +
+        list(reviews_dir.glob(f"{prefix}-r*.json"))
+    )
+    for f in sorted(set(_round_files)):
         if f == current_md or f == current_json:
             continue  # keep the current round
         try:
@@ -1032,6 +1041,15 @@ def run_review(
             }
 
     # ── Specialist review ─────────────────────────────────────────────
+    # Patterns that match actual P1 severity markers in specialist responses.
+    # Excludes the summary line "P1 (blocking): 0" that appears in every response.
+    _p1_patterns = [
+        r"\*\*Severity:\*\*\s*P1",   # **Severity:** P1
+        r"^-\s+\*\*P1\b",            # - **P1 ...
+        r"Severity.*P1.*blocking",    # Severity: P1 (blocking)
+        r"P1\s*[\(\-–]\s*block", # P1 (blocking) / P1 - blocking / P1 – blocking
+    ]
+
     specialist_results: list[dict] = []
 
     # Exclude Cuddy from specialist loop — she already ran as pre-review
@@ -1075,7 +1093,10 @@ def run_review(
                 "files_reviewed": spec_files,
             })
 
-            if "P1" in response or "P1:" in response or "**Severity:** P1" in response:
+            # Check for actual P1 findings using patterns defined above the loop
+            _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                          for p in _p1_patterns)
+            if _has_p1:
                 blocking_findings.append(f"{spec['name']}: P1 found")
                 all_pass = False
             elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
@@ -1104,6 +1125,14 @@ def run_review(
                         "response": response,
                         "files_reviewed": spec_files,
                     })
+                    # Apply same P1/FAIL check as primary path — do NOT skip with continue
+                    _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                                 for p in _p1_patterns)
+                    if _fb_p1:
+                        blocking_findings.append(f"{spec['name']}: P1 found")
+                        all_pass = False
+                    elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                        all_pass = False
                     continue
                 except Exception as exc2:
                     print(f"    -> Fallback also failed: {exc2}")
@@ -1349,11 +1378,16 @@ def _get_appeal_model(board: dict) -> str | None:
 
 def _has_p1_findings(review_data: dict) -> bool:
     """Check if the review has any P1 (non-appealable) findings."""
-    # Check specialist results for P1 patterns
+    _p1_rx = re.compile(
+        r"\*\*Severity:\*\*\s*P1|^-\s+\*\*P1\b|P1\s*[\(\-–]\s*block",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    # Check specialist results — response text is stored in the JSON
     for sr in review_data.get("specialist_results", []):
-        # specialist_results in the JSON only has summary (specialist, model, response_length)
-        # We need to check the full markdown report for P1s
-        pass
+        response = sr.get("response", "") or ""
+        if _p1_rx.search(response):
+            return True
 
     # Check the deterministic scan
     scan = review_data.get("deterministic_scan", {})

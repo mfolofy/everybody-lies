@@ -201,7 +201,7 @@ PATTERNS = [
     (
         "missing-timeout",
         "P2",
-        r"(?i)(?:requests\.(?:get|post|put|delete|patch)|urllib\.request\.urlopen)\s*\([^)]*\)",
+        r"(?i)(?:requests\.(?:get|post|put|delete|patch)|urllib\.request\.urlopen)\s*\((?![^)]*\btimeout\s*=)[^)]*\)",
         "HTTP request without explicit timeout — potential hang forever",
         "Always set a timeout: requests.get(url, timeout=30)",
         None,
@@ -415,8 +415,19 @@ def _match_file_pattern(file_path: str, pattern: str) -> bool:
     """
     import fnmatch
     # Normalize path separators
+    import re as _re
     path = file_path.replace("\\", "/")
     pat = pattern.replace("\\", "/")
+
+    # Expand brace patterns like *.{js,ts,jsx,tsx} into multiple globs
+    brace_match = _re.search(r"\{([^}]+)\}", pat)
+    if brace_match:
+        alternatives = brace_match.group(1).split(",")
+        for alt in alternatives:
+            expanded = pat[:brace_match.start()] + alt.strip() + pat[brace_match.end():]
+            if _match_file_pattern(path, expanded):
+                return True
+        return False
 
     # fnmatch supports * and ? but not **
     # For ** patterns, we need to handle recursively
