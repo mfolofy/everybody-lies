@@ -13,6 +13,26 @@ from functools import lru_cache
 from .config import get_config_dir
 
 
+# ── Key Bootstrap ─────────────────────────────────────────────────────────────
+# If EVERYBODY_LIES_API_KEYS is set (a JSON blob), populate any missing env vars
+# from it at import time. This allows callers (hooks, CLIs, wrappers) to pass
+# all API keys in one environment variable without coupling to secrets.json layout.
+# Only sets keys that are not already present in the environment.
+_JSON_KEYS = os.environ.get("EVERYBODY_LIES_API_KEYS")
+if _JSON_KEYS:
+    try:
+        _KNOWN_VARS = {
+            "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY", "ANTHROPIC_API_KEY",
+        }
+        _parsed = json.loads(_JSON_KEYS)
+        for _var in _KNOWN_VARS:
+            if _parsed.get(_var) and not os.environ.get(_var):
+                os.environ[_var] = _parsed[_var]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+
 # ── Provider Definitions ──────────────────────────────────────────────────────
 
 # Each provider specifies base_url, auth, and which models it serves.
