@@ -12,7 +12,7 @@
 
 ## What is this?
 
-A differential diagnosis for your codebase. Cuddy rules out simpler alternatives first. Then five domain specialists review every commit through their own lens. House issues the final verdict. Unanimous consent required. No bypass. No apologies. No "looks good to me."
+A differential diagnosis for your codebase. Cuddy rules out simpler alternatives first. Then five domain specialists review every commit through their own lens. House issues the final verdict. Unanimous consent required. P1 findings are absolute. P2 findings can be appealed to Wilson. No apologies. No "looks good to me."
 
 Your AI wrote it. It's wrong. House proves exactly why.
 
@@ -43,8 +43,12 @@ Intake → Cuddy (Differential Diagnosis) → Specialists → House (Verdict)
 | **Dr. Robert Chase** 🔒 | Security, DevOps, CI/CD, Automation | Finds your hardcoded credentials. Defaults to P1. |
 | **Dr. Chris Taub** 🔌 | API Contracts, Data Schemas, Integration | Obsessed with consistency. Hates `200 OK` with error body. |
 | **Dr. Remy "Thirteen" Hadley** 🧪 | Edge Cases, Performance, QA | Finds the bug that only reproduces at 3am under peak load. |
+| **Dr. James Wilson** 🩻 | Appeal Judge | House's only friend. The one person who can tell House he's wrong — but he defaults to upholding House. P2-only appeals. P1s are sacred. Uses a **different provider** than the review board — genuine separation of powers. |
 
-Cuddy runs FIRST. She is the gate before the gate. If a simpler approach exists and you didn't rule it out, the code is the wrong approach — regardless of code quality. Then every specialist must PASS for House to approve. One rejection = change rejected. There is no appeal.
+Cuddy runs FIRST. She is the gate before the gate. If a simpler approach exists and you didn't rule it out, the code is the wrong approach — regardless of code quality. Then every specialist must PASS for House to approve. One rejection = change rejected.
+
+**P1 findings are absolute.** Not even Wilson can overturn them. Fix the code.
+**P2 findings can be appealed** — but you have to convince Wilson, not House. See [Appeals](#appeals).
 
 ## Why six reviewers?
 
@@ -72,7 +76,8 @@ You (Human)
             │     ├── Dr. Cameron — Frontend / UX / Design
             │     ├── Dr. Chase — Automation / DevOps / Security
             │     ├── Dr. Taub — Data / API / Integration
-            │     └── Dr. Thirteen — QA / Edge Cases / Performance
+            │     ├── Dr. Thirteen — QA / Edge Cases / Performance
+            │     └── Dr. Wilson — Appeal Judge (P2 rejections only)
             └── Deploy — only AFTER House approval
 ```
 
@@ -155,7 +160,8 @@ $ everybody-lies --staged --tier fast
   [REJECTED] VERDICT: REJECTED
   BLOCKER: Cuddy: P1 — simpler alternative exists, approach is wrong
   BLOCKER: Dr. Remy Hadley (Thirteen): P2 — binary database in version control
-  Fix the issues above and resubmit. There is no appeal.
+  Fix the issues above and resubmit. P1 findings are not appealable.
+  P2 findings: everybody-lies --appeal "your justification"
 ======================================================================
 ```
 
@@ -322,6 +328,78 @@ export EVERYBODY_LIES_HOME=/path/to/config
 ## Dynamic Specialists
 
 House auto-hires specialists for domains the static board doesn't cover. If your code touches trading, ML, blockchain, or databases — and no existing fellow covers that domain — House creates a specialist on the fly. If they produce nothing useful across 5 reviews, House fires them. It's a meritocracy. Unlike your last job.
+
+## Appeals
+
+House rejected your change. You think he's wrong. You can appeal — but only to Wilson, and only for P2 findings.
+
+```bash
+# Appeal a rejection with written justification
+everybody-lies --appeal "The finding is inapplicable because X — the endpoint has no external clients and the schema change is intentional"
+
+# Appeal a specific RFC by ID
+everybody-lies --appeal "justification" --rfc RFC-2026-06-01-pre-commit-review-routes.py
+```
+
+**Wilson's rules:**
+- **P1 findings are sacred.** Auto-denied. Not even Wilson can overturn a credential leak or SQL injection. Fix it.
+- **P2 findings** can be appealed with written justification. Wilson evaluates the argument, not the code.
+- Wilson uses a **different model and provider** than the review board — genuine separation of powers. He can't be House reviewing his own decision.
+- Valid justifications: the finding is factually wrong, the fix is deferred with a named ticket and deadline, the behavior matches project conventions
+- Invalid justifications: "I disagree," "it works," deadline pressure without a plan, vague promises
+
+**Wilson's verdict options:**
+- `APPEAL GRANTED` — House was wrong. Proceed without fixing.
+- `APPEAL DENIED` — House was right. Fix it.
+- `PARTIAL GRANT` — Some findings granted, some denied. Fix the denied ones.
+
+All appeals are logged to `~/.everybody-lies/reviews/appeals.jsonl`. Permanent audit trail.
+
+**Wilson requires an independent provider.** He won't use the same model family as the review board. If you only have DeepSeek configured, Wilson can't run (that's the review board's model — no separation of powers). Set `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY` to unlock appeals.
+
+## Key Bootstrap
+
+House detects API keys from environment variables. If you're running House inside a CI pipeline, a git hook, or a multi-agent workflow where keys aren't in the environment, you have two options:
+
+**Option 1 — JSON blob via env var** (hooks, wrappers, CI):
+```bash
+export EVERYBODY_LIES_API_KEYS='{"DEEPSEEK_API_KEY":"sk-...","GEMINI_API_KEY":"..."}'
+everybody-lies --staged --tier fast
+```
+
+**Option 2 — Secrets file** (standalone CLI use):
+```bash
+# Create a flat JSON file with your keys
+cat > ~/.my-keys.json << 'EOF'
+{
+  "DEEPSEEK_API_KEY": "sk-...",
+  "GEMINI_API_KEY": "...",
+  "ANTHROPIC_API_KEY": "sk-ant-...",
+  "OPENROUTER_API_KEY": "sk-or-..."
+}
+EOF
+
+# Point House at it
+export EVERYBODY_LIES_SECRETS_FILE=~/.my-keys.json
+everybody-lies --appeal "justification"
+```
+
+Both sources are loaded at import time and never overwrite keys already in the environment.
+
+## Cleanup
+
+Review artifacts accumulate. Clean them up:
+
+```bash
+# Remove review artifacts older than 30 days (default)
+everybody-lies --cleanup
+
+# Custom age threshold
+everybody-lies --cleanup --cleanup-days 7
+
+# Preview what would be deleted
+everybody-lies --cleanup --cleanup-dry-run
+```
 
 ## The Fine Print
 
