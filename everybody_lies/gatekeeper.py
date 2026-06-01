@@ -1306,32 +1306,42 @@ def _get_appeal_model(board: dict) -> str | None:
     """Resolve the model for Wilson (appeal judge).
 
     MUST be a different PROVIDER than the review board uses.
-    All specialists use DeepSeek direct API, so Wilson defaults to Gemini
-    via OpenRouter (different provider, different training).
+    DeepSeek is excluded — it's the review board's provider.
 
-    DeepSeek models are EXCLUDED from fallbacks — if no distinct provider
-    is available, returns None (appeal cannot proceed without an
-    independent judge).
+    Resolution order:
+    1. chart.json appeal_judge.model — if its provider is available and non-deepseek
+    2. chart.json appeal_judge.fallback_models — same check
+    3. Any available non-deepseek provider from detect_available_providers()
+       using its best direct model (anthropic → claude-sonnet-4-6,
+       gemini → gemini-2.5-flash, openrouter → google/gemini-2.5-flash)
 
-    Falls back through the appeal_judge.fallback_models list.
+    Returns None only if NO non-deepseek provider has a key.
     """
-    appeal_config = board.get("appeal_judge", {})
-    primary = appeal_config.get("model", "google/gemini-2.5-flash")
-    fallbacks = appeal_config.get("fallback_models",
-        ["anthropic/claude-sonnet-4-6", "openai/gpt-4o"])
+    from .providers import MODEL_ROUTING, PROVIDERS, detect_available_providers
 
-    # Try primary first, then fallbacks
-    providers_to_try = [primary] + fallbacks
-    for model in providers_to_try:
-        try:
-            from .providers import MODEL_ROUTING, PROVIDERS
-            route = MODEL_ROUTING.get(model, ["openrouter"])
-            for provider_key in route:
-                provider = PROVIDERS.get(provider_key)
-                if provider and provider_key != "deepseek" and os.environ.get(provider["env_key"]):
-                    return model
-        except Exception:
-            continue
+    appeal_config = board.get("appeal_judge", {})
+    primary = appeal_config.get("model", "gemini-2.5-flash")
+    fallbacks = appeal_config.get("fallback_models",
+        ["gemini-2.5-flash", "claude-sonnet-4-6", "anthropic/claude-sonnet-4-6",
+         "google/gemini-2.5-flash", "openai/gpt-4o"])
+
+    # Step 1+2: try chart-configured models
+    for model in [primary] + fallbacks:
+        route = MODEL_ROUTING.get(model, ["openrouter"])
+        for provider_key in route:
+            provider = PROVIDERS.get(provider_key)
+            if provider and provider_key != "deepseek" and os.environ.get(provider["env_key"]):
+                return model
+
+    # Step 3: fall back to any available non-deepseek provider
+    _PROVIDER_BEST_MODEL = {
+        "anthropic": "claude-sonnet-4-6",
+        "gemini":    "gemini-2.5-flash",
+        "openrouter": "google/gemini-2.5-flash",
+    }
+    for provider_key in detect_available_providers():
+        if provider_key != "deepseek" and provider_key in _PROVIDER_BEST_MODEL:
+            return _PROVIDER_BEST_MODEL[provider_key]
 
     # No independent judge available — appeal cannot proceed
     return None
