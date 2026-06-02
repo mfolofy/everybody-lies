@@ -25,6 +25,8 @@ from .config import (
     get_stats_path,
     get_dynamic_fellows_path,
     get_appeals_log_path,
+    get_commit_log_path,
+    get_archive_dir,
     ensure_config_dir,
 )
 from .providers import (
@@ -594,47 +596,55 @@ def _build_output_paths(title: str) -> tuple[Path, Path]:
     return md_path, json_path
 
 
-def _cleanup_old_rounds(current_md: Path, current_json: Path,
-                        title: str, date_str: str) -> int:
-    """Delete previous rounds of the same review. Keeps only the latest.
+def _archive_old_rounds(current_md: Path, current_json: Path,
+                        title: str, date_str: str) -> tuple[int, int]:
+    """Archive previous rounds of the same review instead of deleting them.
 
-    When House rejects a change and the agent fixes + resubmits, multiple
-    review rounds accumulate (house-...-slug.md, house-...-slug-r1.md, ...).
-    Only the latest round is relevant — old rounds are in git history.
+    Prior rounds are moved to docs/reviews/archive/ so the full review
+    history is preserved for debugging (e.g. Cuddy contradiction loops).
 
-    Returns the number of files deleted.
+    Returns (archived_count, total_rounds_including_current).
     """
     reviews_dir = get_reviews_dir()
+    archive_dir = get_archive_dir()
     slug = title.lower().replace(" ", "-").replace("/", "-")
     slug = re.sub(r'[<>:"|?*\\]', '', slug)
     slug = re.sub(r'-+', '-', slug)
     slug = slug.strip("-.")[:60]
     if not slug:
-        return 0
+        return 0, 1
 
-    # Find all files matching this review's base slug
     prefix = f"house-{date_str}-{slug}"
-    deleted = 0
-
-    # Use exact prefix + round suffix pattern to avoid matching reviews
-    # whose slugs share a prefix (e.g. "auth" matching "auth-flow" files).
-    # Round files are named: {prefix}.md, {prefix}.json, {prefix}-r1.md, {prefix}-r1.json, etc.
-    _round_files = (
+    prior_rounds = (
         list(reviews_dir.glob(f"{prefix}.md")) +
         list(reviews_dir.glob(f"{prefix}.json")) +
         list(reviews_dir.glob(f"{prefix}-r*.md")) +
         list(reviews_dir.glob(f"{prefix}-r*.json"))
     )
-    for f in sorted(set(_round_files)):
+    archived = 0
+    round_numbers = set()
+    for f in sorted(set(prior_rounds)):
         if f == current_md or f == current_json:
-            continue  # keep the current round
+            continue
         try:
-            f.unlink()
-            deleted += 1
+            dest = archive_dir / f.name
+            f.rename(dest)
+            archived += 1
+            # Extract round number from filename (-r1, -r2, etc.)
+            m = re.search(r'-r(\d+)\.(md|json)$', f.name)
+            round_numbers.add(int(m.group(1)) if m else 0)
         except OSError:
             pass
 
-    return deleted
+    total_rounds = len(round_numbers) + 1  # prior rounds + current
+    return archived, total_rounds
+
+
+# Keep old name as alias for the fast-track path that still uses it
+def _cleanup_old_rounds(current_md: Path, current_json: Path,
+                        title: str, date_str: str) -> int:
+    archived, _ = _archive_old_rounds(current_md, current_json, title, date_str)
+    return archived
 
 
 def run_cleanup(days: int = 30, dry_run: bool = False) -> dict:
@@ -700,6 +710,78 @@ def _prune_stats(cutoff_timestamp: float) -> None:
             stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def _write_commit_log_entry(review_data: dict, verdict: str, bypassed: bool,
+                            commit_sha: str = "", bypass_reason: str = "") -> None:
+    """Append one line to house-commits.jsonl.
+
+    Called on APPROVED from the review pipeline. The commit SHA is unknown at
+    review time (commit hasn't happened yet), so it's left blank and filled in
+    by the post-commit hook via --stamp-commit.
+    """
+    log_path = get_commit_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "commit": commit_sha,        # filled by post-commit hook
+        "rfc_id": review_data.get("rfc_id", ""),
+        "verdict": verdict,
+        "rounds": review_data.get("total_rounds", 1),
+        "tier": review_data.get("review_tier", ""),
+        "files": review_data.get("affected_files", []),
+        "timestamp": review_data.get("timestamp", ""),
+        "bypassed": bypassed,
+        "bypass_reason": bypass_reason or None,
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _stamp_commit_sha(rfc_id: str, sha: str) -> bool:
+    """Back-fill the commit SHA into the most recent house-commits.jsonl entry for an RFC.
+
+    Called by the post-commit hook once git has assigned a SHA.
+    Returns True if the entry was found and updated.
+    """
+    log_path = get_commit_log_path()
+    if not log_path.exists():
+        return False
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    updated = False
+    new_lines = []
+    for line in reversed(lines):
+        if not updated:
+            try:
+                entry = json.loads(line)
+                if entry.get("rfc_id") == rfc_id and not entry.get("commit"):
+                    entry["commit"] = sha
+                    line = json.dumps(entry)
+                    updated = True
+            except Exception:
+                pass
+        new_lines.append(line)
+    if updated:
+        log_path.write_text("\n".join(reversed(new_lines)) + "\n", encoding="utf-8")
+    return updated
+
+
+def _write_bypass_log_entry(commit_sha: str, bypass_reason: str = "") -> None:
+    """Write a bypass entry to house-commits.jsonl when --no-verify is used."""
+    log_path = get_commit_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "commit": commit_sha,
+        "rfc_id": None,
+        "verdict": "BYPASSED",
+        "rounds": 0,
+        "tier": None,
+        "files": [],
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "bypassed": True,
+        "bypass_reason": bypass_reason or None,
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 def _update_stats(review_data: dict) -> None:
@@ -1268,11 +1350,16 @@ def run_review(
     json_path.write_text(json.dumps(review_data, indent=2), encoding="utf-8")
     print(f"  [RECORD] {json_path}")
 
-    # Clean up previous rounds of this same review (keep only the latest)
-    cleaned = _cleanup_old_rounds(md_path, json_path, title,
-                                  datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    if cleaned > 0:
-        print(f"  [CLEANUP] Removed {cleaned} obsolete review round(s)")
+    # Archive previous rounds (preserves history for debugging contradiction loops)
+    archived, total_rounds = _archive_old_rounds(md_path, json_path, title,
+                                                  datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    if archived > 0:
+        print(f"  [ARCHIVE] Archived {archived} prior round(s) → reviews/archive/")
+    if total_rounds > 1:
+        print(f"  [ROUNDS]  This change took {total_rounds} review round(s)")
+
+    # Stamp round count into review_data for the commit log
+    review_data["total_rounds"] = total_rounds
 
     _update_stats(review_data)
 
@@ -1281,7 +1368,13 @@ def run_review(
     if verdict == "APPROVED":
         print(f"  [APPROVED] VERDICT: APPROVED")
         print(f"  Signed: House (Gatekeeper)")
-        print(f"  Include in commit: Reviewed-by: House (Gatekeeper) <noreply@everybody-lies.dev>")
+        rfc_id = review_data.get('rfc_id', 'RFC-unknown')
+        print(f"  House-RFC: {rfc_id}")
+        print(f"  Include in commit message:")
+        print(f"    Reviewed-by: House (Gatekeeper) <noreply@everybody-lies.dev>")
+        print(f"    House-RFC: {rfc_id}")
+        # Write commit log entry (commit SHA filled in by post-commit hook)
+        _write_commit_log_entry(review_data, verdict="APPROVED", bypassed=False)
     else:
         print(f"  [REJECTED] VERDICT: REJECTED")
         if blocking_findings:

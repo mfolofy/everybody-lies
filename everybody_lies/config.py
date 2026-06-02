@@ -58,9 +58,35 @@ def get_appeals_log_path() -> Path:
     return get_reviews_dir() / "appeals.jsonl"
 
 
+def get_commit_log_path() -> Path:
+    """Path to house-commits.jsonl — one entry per commit that went through House.
+
+    Each line is a JSON object:
+    {
+      "commit": "<sha>",          # git commit hash (short)
+      "rfc_id": "RFC-...",        # House review that approved this commit
+      "verdict": "APPROVED",      # APPROVED | BYPASSED
+      "rounds": 2,                # how many review rounds it took
+      "tier": "fast",
+      "timestamp": "2026-...",
+      "bypassed": false,          # true if --no-verify was used
+      "bypass_reason": null       # set by post-commit hook if bypassed
+    }
+    """
+    return get_reviews_dir() / "house-commits.jsonl"
+
+
+def get_archive_dir() -> Path:
+    """Directory for archived prior review rounds (preserved instead of deleted)."""
+    archive = get_reviews_dir() / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    return archive
+
+
 def ensure_config_dir() -> Path:
     """Create config directory if it doesn't exist. Returns the path."""
     path = get_config_dir()
     path.mkdir(parents=True, exist_ok=True)
     (path / "reviews").mkdir(parents=True, exist_ok=True)
+    (path / "reviews" / "archive").mkdir(parents=True, exist_ok=True)
     return path
