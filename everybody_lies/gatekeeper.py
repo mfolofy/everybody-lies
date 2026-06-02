@@ -1354,7 +1354,7 @@ def run_review(
     archived, total_rounds = _archive_old_rounds(md_path, json_path, title,
                                                   datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     if archived > 0:
-        print(f"  [ARCHIVE] Archived {archived} prior round(s) → reviews/archive/")
+        print(f"  [ARCHIVE] Archived {archived} prior round(s) -> reviews/archive/")
     if total_rounds > 1:
         print(f"  [ROUNDS]  This change took {total_rounds} review round(s)")
 
