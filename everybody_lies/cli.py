@@ -15,7 +15,10 @@ import argparse
 import sys
 import textwrap
 
-from .gatekeeper import run_review, run_onboarding, run_appeal, run_cleanup
+from .gatekeeper import (
+    run_review, run_onboarding, run_appeal, run_cleanup,
+    _stamp_commit_sha, _write_bypass_log_entry,
+)
 
 
 def main() -> None:
@@ -66,8 +69,28 @@ def main() -> None:
     parser.add_argument("--cleanup", action="store_true", help="Prune review artifacts older than --cleanup-days (default 30)")
     parser.add_argument("--cleanup-days", type=int, default=30, help="Age threshold in days for --cleanup (default: 30)")
     parser.add_argument("--cleanup-dry-run", action="store_true", help="Show what --cleanup would delete without deleting")
+    # Hook integration — called by post-commit and post-commit-bypass hooks
+    parser.add_argument("--stamp-commit", default="", metavar="SHA",
+                        help="Back-fill commit SHA into the latest House log entry for --rfc")
+    parser.add_argument("--log-bypass", default="", metavar="SHA",
+                        help="Write a BYPASSED entry to house-commits.jsonl for this commit SHA")
+    parser.add_argument("--bypass-reason", default="", help="Reason for bypass (used with --log-bypass)")
 
     args = parser.parse_args()
+
+    # ── Hook integration paths ────────────────────────────────────────
+    if args.stamp_commit:
+        ok = _stamp_commit_sha(rfc_id=args.rfc_id, sha=args.stamp_commit)
+        if ok:
+            print(f"[HOUSE-LOG] Stamped commit {args.stamp_commit[:8]} → {args.rfc_id}")
+        else:
+            print(f"[HOUSE-LOG] No pending log entry found for {args.rfc_id}", file=sys.stderr)
+        sys.exit(0 if ok else 1)
+
+    if args.log_bypass:
+        _write_bypass_log_entry(commit_sha=args.log_bypass, bypass_reason=args.bypass_reason)
+        print(f"[HOUSE-LOG] Bypass recorded: commit {args.log_bypass[:8]}")
+        sys.exit(0)
 
     if args.onboard:
         run_onboarding()
