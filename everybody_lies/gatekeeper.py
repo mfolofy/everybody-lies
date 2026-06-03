@@ -1363,6 +1363,46 @@ def run_review(
 
     _update_stats(review_data)
 
+    # ── Diagnostics: record performance event ─────────────────────────
+    try:
+        from .diagnostics import (
+            record_commit_event, parse_findings_from_md,
+            specialist_key as _skey, parse_attribution,
+        )
+        loop_detected = total_rounds >= 3 and verdict == "REJECTED"
+        import subprocess as _sp
+        _git_log = _sp.run(
+            ["git", "log", "-1", "--format=%B"],
+            capture_output=True, text=True,
+        ).stdout
+        submitter_key = "unknown/unknown"
+        submitter_display = "Unknown"
+        for _line in _git_log.splitlines():
+            if _line.strip().lower().startswith("co-authored-by:"):
+                _identity = parse_attribution(_line.split(":", 1)[-1].strip())
+                submitter_key = _identity.get("key", submitter_key)
+                submitter_display = _identity.get("name", submitter_display)
+                break
+        md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+        _spec_findings = parse_findings_from_md(md_text)
+        _spec_models = {
+            sr.get("specialist", ""): sr.get("model", "unknown")
+            for sr in specialist_results
+        }
+        record_commit_event(
+            rfc_id=review_data.get("rfc_id", "unknown"),
+            verdict=verdict,
+            rounds=total_rounds,
+            submitter_key=submitter_key,
+            submitter_display=submitter_display,
+            specialist_findings=_spec_findings,
+            specialist_models=_spec_models,
+            loop_detected=loop_detected,
+            bypass_was_reviewer_fault=loop_detected,
+        )
+    except Exception:
+        pass  # diagnostics are non-blocking
+
     # ── VERDICT ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}")
     if verdict == "APPROVED":
@@ -1385,6 +1425,22 @@ def run_review(
             print(f"  P1 findings — not appealable. Fix them. Not even Wilson can help you.")
         else:
             print(f"  No P1 findings — may appeal to Wilson: everybody-lies --appeal \"justification\" --rfc {review_data.get('rfc_id', 'RFC-unknown')}")
+        # ── Loop alert with Diagnostics tiebreak hint ─────────────────
+        if total_rounds >= 3:
+            print(f"\n  [DIAGNOSTICS] Loop detected ({total_rounds} rounds). Cuddy tiebreak available.")
+            try:
+                from .diagnostics import load_ledger, get_daily_score, score_to_label, today_str
+                ledger = load_ledger()
+                if ledger:
+                    print(f"  Current daily grades:")
+                    for k, v in sorted(ledger.items(), key=lambda x: x[0]):
+                        if k.startswith("specialist/"):
+                            score = get_daily_score(v)
+                            print(f"    {v['display']:<35} {score:.0f}  {score_to_label(score)}")
+                    print(f"  Lower-scored specialist loses the disputed finding.")
+                    print(f"  Run: python -m everybody_lies.diagnostics  (morning report)")
+            except Exception:
+                pass
     print(f"{'=' * 70}\n")
 
     _save_dynamic_fellows()
