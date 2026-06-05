@@ -255,6 +255,65 @@ everybody-lies --staged --tier fast
 
 Now nobody commits without House's signature. Including you. Especially you.
 
+## Pre-Push Scope Enforcement (Patient File)
+
+The pre-push hook prevents pushing the wrong files to the wrong remote. It's the fix for the P0 class of incident where an agent pushes an entire monorepo into a clean external repo.
+
+### How it works
+
+Create `.house/patients.json` in your repo root:
+
+```json
+{
+  "remotes": {
+    "origin": {
+      "allowed_paths": ["**"],
+      "blocked_paths": ["secrets/**", "*.pem", ".env*", "*.key"],
+      "force_push": "warn",
+      "block_tags": false,
+      "block_deletes": false,
+      "bypass_protected": false
+    },
+    "external-repo": {
+      "allowed_paths": ["external-repo/**"],
+      "blocked_paths": ["secrets/**", "*.pem", ".env*"],
+      "force_push": "deny",
+      "block_tags": true,
+      "block_deletes": true,
+      "bypass_protected": true
+    }
+  },
+  "default": {
+    "allowed_paths": [],
+    "blocked_paths": ["**"],
+    "force_push": "deny",
+    "block_tags": true,
+    "block_deletes": true,
+    "bypass_protected": false
+  }
+}
+```
+
+Install the hook:
+
+```bash
+cp docs/hooks/pre-push .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
+### Rules
+
+- **`blocked_paths` always wins** over `allowed_paths`
+- **Unknown remotes block everything** — add an explicit entry to allow
+- **`bypass_protected: true`** means `HOUSE_BYPASS=1` does **not** skip the check for that remote — the only way past is fixing the files
+- **`force_push: "deny"`** blocks force pushes; `"warn"` allows with a warning
+- **`block_tags: true`** blocks `git push --tags` and individual tag pushes
+- **`block_deletes: true`** blocks `git push origin :branch`
+
+### Schema reference
+
+See `docs/patients.example.json` for a full annotated example.
+
 ## ITIL Compliance
 
 Every review is an ITIL **Request for Change (RFC)**. Every finding is classified:

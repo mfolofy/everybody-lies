@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy to .house/patients.json in your repo root. blocked_paths always wins over allowed_paths.",
+  "remotes": {
+    "origin": {
+      "allowed_paths": ["**"],
+      "blocked_paths": ["secrets/**", "*.pem", ".env*", "*.key", "**/credentials*"],
+      "force_push": "warn",
+      "block_tags": false,
+      "block_deletes": false,
+      "bypass_protected": false
+    },
+    "external-repo": {
+      "_comment": "Example: only files under external-repo/ allowed. bypass_protected blocks HOUSE_BYPASS.",
+      "allowed_paths": ["external-repo/**"],
+      "blocked_paths": ["secrets/**", "*.pem", ".env*", "*.key"],
+      "force_push": "deny",
+      "block_tags": true,
+      "block_deletes": true,
+      "bypass_protected": true
+    }
+  },
+  "default": {
+    "_comment": "Any remote not listed above. Block everything — add explicit entry to allow pushes.",
+    "allowed_paths": [],
+    "blocked_paths": ["**"],
+    "force_push": "deny",
+    "block_tags": true,
+    "block_deletes": true,
+    "bypass_protected": false
+  }
+}

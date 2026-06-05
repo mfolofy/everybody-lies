@@ -1,0 +1,28 @@
+#!/bin/sh
+# House pre-push scope enforcement hook.
+# Install: cp docs/hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# Checks pushed files against .house/patients.json per-remote scope policy.
+# Unknown remotes are blocked by default. HOUSE_BYPASS=1 skips (bypass_protected remotes excepted).
+
+REMOTE="$1"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+
+if [ -z "$REPO_ROOT" ]; then
+  echo "[HOUSE] WARNING: could not determine repo root — pre-push check skipped" >&2
+  exit 0
+fi
+
+PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+if [ -z "$PYTHON" ]; then
+  echo "[HOUSE] WARNING: python not found — pre-push scope check skipped" >&2
+  exit 0
+fi
+
+if ! "$PYTHON" -c "import everybody_lies" 2>/dev/null; then
+  echo "[HOUSE] WARNING: everybody_lies not installed — pre-push scope check skipped" >&2
+  exit 0
+fi
+
+# Pass all stdin (refspecs from git) to the Python checker
+"$PYTHON" -m everybody_lies --pre-push --remote "$REMOTE"

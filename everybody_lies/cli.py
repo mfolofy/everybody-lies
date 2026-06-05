@@ -9,6 +9,7 @@ Usage:
     everybody-lies --onboard                      # Configure API keys and models
     everybody-lies --ci github-actions            # CI mode: GitHub Actions annotations
     everybody-lies --spec                         # Auto-detect and use SPEC.md for Cuddy
+    everybody-lies --pre-push --remote origin     # Pre-push scope check (called by git hook)
 """
 
 import argparse
@@ -17,6 +18,7 @@ import textwrap
 
 from .gatekeeper import (
     run_review, run_onboarding, run_appeal, run_cleanup,
+    run_pre_push_check,
     _stamp_commit_sha, _write_bypass_log_entry,
 )
 
@@ -75,8 +77,51 @@ def main() -> None:
     parser.add_argument("--log-bypass", default="", metavar="SHA",
                         help="Write a BYPASSED entry to house-commits.jsonl for this commit SHA")
     parser.add_argument("--bypass-reason", default="", help="Reason for bypass (used with --log-bypass)")
+    # Pre-push scope check — called by .git/hooks/pre-push
+    parser.add_argument("--pre-push", action="store_true",
+                        help="Pre-push scope check mode. Reads git refspecs from stdin.")
+    parser.add_argument("--remote", default="",
+                        help="Remote name for --pre-push (git passes this as $1 in the hook)")
 
     args = parser.parse_args()
+
+    # ── Pre-push scope check ─────────────────────────────────────────
+    if args.pre_push:
+        if not args.remote:
+            print("ERROR: --pre-push requires --remote <name>", file=sys.stderr)
+            sys.exit(1)
+        refs = []
+        for line in sys.stdin:
+            parts = line.strip().split()
+            if len(parts) == 4:
+                # git pre-push stdin format: local_ref local_sha remote_ref remote_sha
+                # local_sha = what we're pushing (new), remote_sha = current tip (old)
+                refs.append({
+                    "local_ref":  parts[0],
+                    "local_sha":  parts[1],  # new commit — what's being pushed
+                    "remote_ref": parts[2],
+                    "remote_sha": parts[3],  # old commit — current remote tip
+                })
+            elif parts:  # non-empty but malformed
+                print(f"[HOUSE] WARNING: skipping malformed refspec line: {line.rstrip()!r}",
+                      file=sys.stderr)
+        result = run_pre_push_check(args.remote, refs)
+        verdict = result.get("verdict", "REJECTED")
+        if verdict == "REJECTED":
+            reason = result.get("reason", "scope violation")
+            print(f"\n{'=' * 70}", file=sys.stderr)
+            print(f"  [HOUSE — PRE-PUSH BLOCKED]", file=sys.stderr)
+            print(f"  Remote: {args.remote}  Reason: {reason}", file=sys.stderr)
+            violations = result.get("violations") or []
+            for v in violations[:20]:  # cap output on large repos
+                print(f"  ✗ {v}", file=sys.stderr)
+            if len(violations) > 20:
+                print(f"  ... and {len(violations) - 20} more", file=sys.stderr)
+            print(f"  Set HOUSE_BYPASS=1 to override (logged). Fix .house/patients.json to allow.",
+                  file=sys.stderr)
+            print(f"{'=' * 70}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     # ── Hook integration paths ────────────────────────────────────────
     if args.stamp_commit:

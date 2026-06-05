@@ -122,6 +122,186 @@ def _check_no_running_subagents() -> None:
         print(f"{'=' * 70}", file=sys.stderr)
         sys.exit(1)
 
+# ── Pre-push patient file — scope enforcement ────────────────────────────────
+#
+# Design decisions (pre-ruled-out alternatives):
+#
+# 1. Not server-side: we do not control CI on external remotes (shiftctl, etc.).
+#    Server-side is ideal long-term; client-side is the only option available now.
+#
+# 2. Not shell-only: this fleet runs Windows + macOS + Linux. Shell glob matching
+#    (**) is not portable. Python is already required (Cuddy pre-flight runs Python).
+#
+# 3. New functions not scan_diff reuse: scan_diff operates on staged diffs (index).
+#    Pre-push operates on git objects (rev-list). Different data source. We reuse
+#    _match_file_pattern from scanner.py for glob matching.
+#
+# 4. New patients.json not chart.json merger: chart.json is package-internal config
+#    (specialists, models, tiers). patients.json is repo-level push policy — different
+#    owner, different change cadence. Separation is intentional.
+
+_PATIENTS_FILENAME = os.path.join(".house", "patients.json")
+_NULL_SHA = "0" * 40  # SHA-1 null object; named constant to avoid magic strings
+
+
+def _load_patients_config() -> dict:
+    """Load .house/patients.json relative to repo root. Returns block-all default on error."""
+    _default_policy: dict = {
+        "allowed_paths": [],
+        "blocked_paths": ["**"],
+        "force_push": "deny",
+        "block_tags": True,
+        "block_deletes": True,
+        "bypass_protected": False,
+    }
+    _fallback = {"remotes": {}, "default": _default_policy}
+    try:
+        # Resolve relative to repo root so this works regardless of cwd
+        repo_root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        config_path = os.path.join(repo_root, _PATIENTS_FILENAME)
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+        # Validate top-level shape
+        if not isinstance(data.get("remotes"), dict):
+            raise ValueError("patients.json missing 'remotes' dict")
+        if "default" not in data:
+            data["default"] = _default_policy
+        return data
+    except FileNotFoundError:
+        return _fallback
+    except (json.JSONDecodeError, ValueError, subprocess.CalledProcessError, OSError) as exc:
+        print(f"[HOUSE] WARNING: patients.json load failed ({exc}) — using block-all default",
+              file=sys.stderr)
+        return _fallback
+
+
+def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
+    """Return file paths introduced in old_sha..new_sha via git rev-list --objects.
+
+    Uses old_sha (remote tip) as the base so only new objects are listed —
+    handles force pushes correctly (does not re-scan historical objects).
+    On new branches (old_sha == NULL_SHA), lists all objects in new_sha.
+    """
+    if old_sha == _NULL_SHA or not old_sha:
+        cmd = ["git", "rev-list", "--objects", new_sha]
+    else:
+        cmd = ["git", "rev-list", "--objects", f"{old_sha}..{new_sha}"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"git rev-list failed: {result.stderr.strip()}")
+    paths = []
+    for line in result.stdout.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[1].strip():
+            paths.append(parts[1].strip())
+    return paths
+
+
+def _check_paths_against_scope(files: list[str], remote_config: dict) -> list[str]:
+    """Return list of violation strings for files that violate remote_config scope.
+
+    blocked_paths always wins over allowed_paths.
+    If allowed_paths is empty ([]), no path restriction applies (allow all).
+    If allowed_paths is non-empty, files must match at least one pattern.
+    """
+    from .scanner import _match_file_pattern  # reuse existing glob matcher
+
+    allowed = remote_config.get("allowed_paths", [])
+    blocked = remote_config.get("blocked_paths", [])
+    violations = []
+    for f in files:
+        # blocked wins unconditionally
+        if any(_match_file_pattern(f, pat) for pat in blocked):
+            violations.append(f"BLOCKED: {f}")
+            continue
+        # allowed=[]: no restriction. allowed non-empty: must match.
+        if allowed and not any(_match_file_pattern(f, pat) for pat in allowed):
+            violations.append(f"OUT-OF-SCOPE: {f}")
+    return violations
+
+
+def run_pre_push_check(remote_name: str, refs: list[dict]) -> dict:
+    """Pre-push scope enforcement. Called by the pre-push git hook.
+
+    refs: list of dicts with keys:
+        local_ref  — refs/heads/branch or refs/tags/tag
+        local_sha  — SHA of local commit being pushed (new_sha)
+        remote_ref — refs/heads/branch on the remote
+        remote_sha — SHA of current remote tip (old_sha)
+
+    Returns dict with keys: verdict (APPROVED|REJECTED|BYPASSED),
+    reason (str|None), violations (list|None).
+
+    bypass_protected=True on a remote means HOUSE_BYPASS=1 does NOT skip it.
+    """
+    patients = _load_patients_config()
+    remote_config = patients["remotes"].get(remote_name, patients["default"])
+    bypass_active = (os.environ.get("HOUSE_BYPASS") == "1"
+                     and not remote_config.get("bypass_protected", False))
+    if bypass_active:
+        return {"verdict": "BYPASSED", "reason": f"HOUSE_BYPASS on {remote_name}",
+                "violations": None}
+
+    files: list[str] = []
+    for ref in refs:
+        new_sha = ref.get("local_sha", "")    # local commit = what we're pushing
+        old_sha = ref.get("remote_sha", _NULL_SHA)  # remote tip = where we're pushing from
+        remote_ref = ref.get("remote_ref", "")
+
+        if new_sha == _NULL_SHA or not new_sha:  # branch delete
+            if remote_config.get("block_deletes", False):
+                return {"verdict": "REJECTED",
+                        "reason": f"branch delete blocked on '{remote_name}'",
+                        "violations": None}
+            continue
+
+        if remote_ref.startswith("refs/tags/"):
+            if remote_config.get("block_tags", False):
+                return {"verdict": "REJECTED",
+                        "reason": f"tag push blocked on '{remote_name}'",
+                        "violations": None}
+            continue
+
+        force_push = (old_sha != _NULL_SHA and old_sha
+                      and subprocess.run(
+                          ["git", "merge-base", "--is-ancestor", old_sha, new_sha],
+                          capture_output=True).returncode != 0)
+        if force_push:
+            policy = remote_config.get("force_push", "deny")
+            if policy == "deny":
+                return {"verdict": "REJECTED",
+                        "reason": f"force push denied on '{remote_name}'",
+                        "violations": None}
+            if policy == "warn":
+                print(f"[HOUSE] WARNING: force push to '{remote_name}' — proceed with caution",
+                      file=sys.stderr)
+
+        try:
+            objects = _git_rev_list_objects(old_sha, new_sha)
+            files.extend(objects)
+        except Exception as exc:
+            return {"verdict": "REJECTED",
+                    "reason": f"git rev-list failed: {exc}",
+                    "violations": None}
+
+    try:
+        violations = _check_paths_against_scope(files, remote_config)
+    except Exception as exc:
+        return {"verdict": "REJECTED",
+                "reason": f"scope check failed: {exc}",
+                "violations": None}
+
+    if violations:
+        return {"verdict": "REJECTED", "reason": "out-of-scope files detected",
+                "violations": violations}
+    return {"verdict": "APPROVED", "reason": None, "violations": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 from .config import (
     get_config_dir,
     get_chart_path,
