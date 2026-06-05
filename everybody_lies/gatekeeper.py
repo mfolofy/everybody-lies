@@ -1335,6 +1335,23 @@ def run_review(
     risk_score = _calculate_risk_score(files, diff_text)
     recommended_tier = _recommend_tier(risk_score)
 
+    # Enforce tier floor from file patterns + risk score
+    tier_floor = _calculate_tier_floor(files, risk_score, board)
+    _tier_rank = {"fast": 0, "standard": 1, "adversarial": 2}
+
+    # Also apply HOUSE_GATE tier_floor if present
+    gate = _parse_house_gate()
+    gate_tier = gate.get("tier_floor", "")
+    if gate_tier and _tier_rank.get(gate_tier, 0) > _tier_rank.get(tier_floor, 0):
+        tier_floor = gate_tier
+
+    if _tier_rank.get(tier_floor, 0) > _tier_rank.get(tier, 0):
+        print(f"  [HOUSE] Tier upgraded: {tier} -> {tier_floor} (floor from files/risk/gate)")
+        tier = tier_floor
+    elif recommended_tier != tier:
+        # Keep existing mismatch warning when floor doesn't kick in
+        print(f"  [!] Tiers don't match -- Orchestrator chose {tier}, House recommends {recommended_tier}")
+
     print(f"\n{'=' * 70}")
     print(f"  HOUSE GATEKEEPER -- Code Review")
     print(f"{'=' * 70}")
@@ -1343,8 +1360,6 @@ def run_review(
     print(f"  Risk:   {risk_score}/5.0 -> recommended tier: {recommended_tier}")
     print(f"  Tier:   {tier}")
     print(f"  Type:   {change_type}")
-    if recommended_tier != tier:
-        print(f"  [!] Tiers don't match -- Orchestrator chose {tier}, House recommends {recommended_tier}")
     print(f"{'=' * 70}\n")
 
     for spec_id, spec_files in routing.items():
