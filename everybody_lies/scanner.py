@@ -433,12 +433,38 @@ def _match_file_pattern(file_path: str, pattern: str) -> bool:
     # For ** patterns, we need to handle recursively
     if "**" in pat:
         parts = pat.split("**")
-        # Match the first part, then anything can match the **
-        if parts[0] and not fnmatch.fnmatch(path, parts[0] + "*"):
-            return False
-        if len(parts) > 1 and parts[1]:
-            if not path.endswith(parts[1]) and not fnmatch.fnmatch(path, "*" + parts[1]):
+        pat_starts_starstar = pat.startswith("**")
+        pat_ends_starstar = pat.endswith("**")
+
+        # First part (prefix): must match start if pattern doesn't begin with **
+        if not pat_starts_starstar and parts[0]:
+            if not fnmatch.fnmatch(path, parts[0] + "*"):
                 return False
+
+        # Middle parts: must appear in the path in order
+        pos = 0
+        start_idx = 1 if pat_starts_starstar else 0
+        end_idx = len(parts) - 1 if pat_ends_starstar else len(parts)
+        for i in range(start_idx, end_idx):
+            if parts[i]:
+                seg = parts[i]
+                idx = path.find(seg, pos)
+                matched_len = len(seg)
+                if idx == -1:
+                    # Try without leading / (handles **/dir/** matching "dir/file")
+                    alt = seg.lstrip("/")
+                    if alt != seg:
+                        idx = path.find(alt, pos)
+                        matched_len = len(alt)
+                if idx == -1:
+                    return False
+                pos = idx + matched_len
+
+        # Last part (suffix): must match end if pattern doesn't end with **
+        if not pat_ends_starstar and len(parts) > 0 and parts[-1]:
+            if not path.endswith(parts[-1]) and not fnmatch.fnmatch(path, "*" + parts[-1]):
+                return False
+
         return True
 
     return fnmatch.fnmatch(path, pat)

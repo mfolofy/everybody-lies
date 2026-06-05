@@ -354,5 +354,24 @@
       "thirteen"
     ],
     "_note": "Thirteen always reviews everything as the default catch-all. Additional specialists are routed based on file patterns."
+  },
+  "tier_floors": {
+    "file_patterns": [
+      {"pattern": "**/migrations/**",    "min_tier": "standard"},
+      {"pattern": "**/migrate*.py",      "min_tier": "standard"},
+      {"pattern": "**/db/schema*",       "min_tier": "standard"},
+      {"pattern": "**/db/migrate*",      "min_tier": "standard"},
+      {"pattern": "**/auth/**",          "min_tier": "standard"},
+      {"pattern": "**/trading_core/**",  "min_tier": "adversarial"},
+      {"pattern": "**/gs-rev-*/**",      "min_tier": "adversarial"},
+      {"pattern": "**/.env*",            "min_tier": "adversarial"},
+      {"pattern": "**/secrets/**",       "min_tier": "adversarial"},
+      {"pattern": "**/*.pem",            "min_tier": "adversarial"},
+      {"pattern": "**/*.key",            "min_tier": "adversarial"}
+    ],
+    "risk_score_floors": [
+      {"min_score": 4.0, "min_tier": "adversarial"},
+      {"min_score": 2.5, "min_tier": "standard"}
+    ]
   }
 }
