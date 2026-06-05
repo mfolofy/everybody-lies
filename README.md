@@ -12,22 +12,15 @@
 
 ---
 
-## Why This Exists — What It Feels Like When AI Gets It Wrong
+## Why This Exists
 
-Pre-commit review: catches the logic that passes every test and still drops the indexes in prod.
-Cuddy pre-flight: blocks the commit when the other agent is still mid-edit and hasn't pushed.
-Pre-push patient file: stops the monorepo (secrets included) from landing on the wrong remote.
-HOUSE_GATE: forces the agent to declare its actual intent so the rest of the system isn't guessing from a diff.
+Your agents write code that passes tests and still drops indexes in prod. Pre-commit review catches the logic. Cuddy pre-flight blocks the commit when another agent is mid-edit with uncommitted changes. Pre-push scope enforcement stops the monorepo (secrets included) from landing on the wrong remote. HOUSE_GATE forces the agent to declare its actual intent so the rest of the system isn't guessing from a diff.
 
 Because "it worked on my run" has already cost real data.
 
----
-
-## What is this?
-
 A differential diagnosis for your codebase. Cuddy rules out simpler alternatives first. Then five domain specialists review every commit through their own lens. House issues the final verdict. Unanimous consent required. P1 findings are absolute. P2 findings can be appealed to Wilson. No apologies. No "looks good to me."
 
-Three built-in enforcement gates keep your repo clean: pre-commit quality review, Cuddy pre-flight (blocks commits while subagents are running), and pre-push scope enforcement (prevents pushing monorepo files to external remotes). Agents declare their context via `HOUSE_GATE`. Tier floors auto-upgrade review intensity for high-risk files.
+Three built-in enforcement gates keep your repo clean: pre-commit quality review, Cuddy pre-flight, and pre-push scope enforcement. Agents declare context via `HOUSE_GATE`. Tier floors auto-upgrade review intensity for high-risk files.
 
 Your AI wrote it. It's wrong. House proves exactly why.
 
@@ -52,11 +45,7 @@ Specialists (tier floor enforced)
 House Verdict
 ```
 
-**HOUSE_GATE** — Agents declare their environment before committing: are subagents running? What locked decisions apply? Minimum tier floor? This context feeds into every downstream check.
-
-**Cuddy Pre-Flight** — Before any review, Cuddy checks for running opencode subagents (stale processes holding RAM, may have uncommitted changes). Also auto-discovers `CHARTER.md`, `PHASE*_PRD.md`, and `*_SPEC.md` in the repo root, extracts "Locked Decisions" sections, and injects them into Cuddy's differential diagnosis as ground truth — eliminating false positives from re-litigating approved design decisions.
-
-**Tier Floor** — File patterns (`**/migrations/**` → standard, `**/trading_core/**` → adversarial) and risk score (≥ 4.0 → adversarial) auto-upgrade the review tier. No more accidentally running `--tier fast` on a database migration.
+See [HOUSE_GATE](#house_gate--agent-declared-context) for the single source of truth on that variable.
 
 ## The Review Board
 
@@ -72,19 +61,10 @@ House Verdict
 
 Cuddy runs FIRST. She is the gate before the gate. If a simpler approach exists and you didn't rule it out, the code is the wrong approach — regardless of code quality. Then every specialist must PASS for House to approve. One rejection = change rejected.
 
-**P1 findings are absolute.** Not even Wilson can overturn them. Fix the code.
+**P1 findings are absolute.** Not even Wilson can overturn them. Fix the code.  
 **P2 findings can be appealed** — but you have to convince Wilson, not House. See [Appeals](#appeals).
 
-## Why six reviewers?
-
-Most code review tools use one AI with a generic prompt. That's like diagnosing a patient by asking "what hurts?" and stopping there. House runs a differential — Cuddy rules out simpler alternatives, then five domain experts, five perspectives, one verdict.
-
-- **One reviewer** doesn't ask "is this even necessary?"
-- **One reviewer** misses domain-specific issues
-- **One reviewer** doesn't catch security if it's not looking for security
-- **One reviewer** says "LGTM" because it doesn't know what it doesn't know
-
-Cuddy + five specialists who hate your code > one model who barely read it.
+One reviewer doesn't ask "is this even necessary?", misses domain-specific issues, or catches security when it isn't looking for security. Cuddy + five specialists who hate your code > one model who barely read it.
 
 ## Integration — Multi-Agent Workflows
 
@@ -130,6 +110,8 @@ your-agent writes code → everybody-lies reviews it → agent fixes findings �
 Each call is stateless. House reads the diff, dispatches the review board, issues a verdict. Your agent, your CI pipeline, or your pre-commit hook decides what to do with it. House just tells you what's wrong.
 
 **Auto-detection works across environments.** Your laptop might have `ANTHROPIC_API_KEY` (Claude Code). Your CI runner might have `DEEPSEEK_API_KEY` (cheaper). Your teammate might use `OPENROUTER_API_KEY`. House detects whatever is available and uses the best model for each reviewer. Same tool. Different keys. Same verdict.
+
+(The pipeline diagram above is the single canonical description; the sections below reference it.)
 
 ## Tiers
 
@@ -247,7 +229,6 @@ $ everybody-lies --staged --tier fast
     -> 3468 chars received
 
   [REPORT] ~/.everybody-lies/reviews/house-2026-05-30-cuddy-live-test.md
-  [RECORD] ~/.everybody-lies/reviews/house-2026-05-30-cuddy-live-test.json
 
 ======================================================================
   [REJECTED] VERDICT: REJECTED
@@ -258,37 +239,12 @@ $ everybody-lies --staged --tier fast
 ======================================================================
 ```
 
-**What happened:**
-
-1. **Deterministic scan** (1.75ms, free) caught `DEBUG=True` and a hardcoded API key before any AI was invoked
-2. **Cuddy** reviewed the full diff and found three un-ruled-out simpler alternatives — the developer committed a binary `.db` file instead of generating it at build time. No justification. Approach rejected.
-3. **Thirteen** backed her up — P2 finding on binary database bloat, merge conflicts, potential data leaks
-4. **House** synthesized both, resolved the conflict (Cuddy and Thirteen agree — reject), issued REJECTED with Cuddy's approach-level P1 listed first
-
-The deterministic scan caught the security issues in 1.75ms. Cuddy caught the approach failure. The specialist caught the operational risk. House delivered the verdict.
-
-**Report excerpt — Cuddy's differential diagnosis:**
-
-> ### Alternative 1: Track only the job-tracker source code, ignore the database file
-> - **Ruled out?** NO. The developer removed `job-tracker/` from `.gitignore`, which will now track everything inside that directory—including `jobs.db`, a binary SQLite database file. There is zero justification for why a binary database should be version-controlled. Standard practice: keep `job-tracker/` in `.gitignore` entirely, or add `job-tracker/data/` or `*.db` to `.gitignore`.
-> - **Better approach:** Add `job-tracker/backend/data/*.db` to `.gitignore` and track only the code. If the database is meant to be a seed, generate it during setup instead of committing a binary blob.
->
-> **Verdict: FAIL P1.** The core change is poorly justified and introduces a binary artifact into version control. The simpler approach is to either ignore the database or keep the entire directory ignored.
-
-**Report excerpt — House's synthesis:**
-
-> Cuddy's job is to rule out simpler alternatives before you clowns start prettifying code. She found three simpler, un-ruled-out alternatives — all pointing to the same moronic decision: tracking a binary SQLite database file because you removed `job-tracker/` from `.gitignore` without any justification.
->
-> No conflict between Cuddy and Thirteen. Both say reject.
->
-> **REJECTED.** Fix the approach first. Come back when you've thought about it for more than 30 seconds. I'll be in my office, doing actual work.
+Cuddy caught a binary `.db` file committed to version control because someone removed `job-tracker/` from `.gitignore` with zero justification. The deterministic scan caught `DEBUG=True` and a hardcoded API key in 1.75ms before any AI was invoked. House's synthesis: *"Fix the approach first. Come back when you've thought about it for more than 30 seconds."*
 
 ## Quickstart
 
 ```bash
 pip install everybody-lies
-# or, from GitHub Releases:
-pip install https://github.com/mfolofy/everybody-lies/releases/download/v0.2.0/everybody_lies-0.2.0-py3-none-any.whl
 ```
 
 **If you're a Claude Code user:** Your `ANTHROPIC_API_KEY` is already in your environment. The tool auto-detects it. Zero configuration.
@@ -348,16 +304,7 @@ everybody-lies --staged --tier fast
 
 Now nobody commits without House's signature. Including you. Especially you.
 
-### What the pre-commit hook runs
-
-The pre-commit hook runs a multi-stage pipeline:
-
-1. **Cuddy Pre-Flight** — checks for running opencode subagents (process scan). Blocks the commit if any are found. Skipped if `HOUSE_BYPASS=1` or `HOUSE_GATE={"subagents_running":false}`.
-2. **PRD Auto-Injection** — scans repo root for `CHARTER.md`, `PHASE*_PRD.md`, `*_SPEC.md`, extracts "Locked Decisions" sections, and feeds them into Cuddy as undisputed ground truth.
-3. **Deterministic Pre-Scan** — pattern-based scan (1.75ms, zero AI cost) catches hardcoded credentials, debug-enabled, unresolved TODOs before any LLM is invoked.
-4. **Cuddy Differential Diagnosis** — rules out simpler alternatives before specialists touch the code. Locked decisions from PRD injection prevent false positives.
-5. **Specialists** — domain experts review through their respective lenses. Tier floor enforced.
-6. **House Verdict** — synthesizes all findings, issues APPROVED or REJECTED.
+(The pipeline it actually runs is documented in The Pipeline section.)
 
 ### Using HOUSE_GATE with the pre-commit hook
 
@@ -584,97 +531,8 @@ everybody-lies --cleanup --cleanup-days 7
 everybody-lies --cleanup --cleanup-dry-run
 ```
 
-## Operations / How-To
-
-### Installing both hooks
-
-```bash
-# From your repo root — install pre-commit hook
-cat > .git/hooks/pre-commit << 'EOF'
-#!/bin/bash
-everybody-lies --staged --tier fast
-EOF
-chmod +x .git/hooks/pre-commit
-
-# Install pre-push hook (scope enforcement)
-cp docs/hooks/pre-push .git/hooks/pre-push
-chmod +x .git/hooks/pre-push
-```
-
-### Configuring patients.json for a new remote
-
-1. Copy `docs/patients.example.json` to `.house/patients.json`
-2. Add your remote under `remotes`:
-   ```json
-   "my-package-repo": {
-     "allowed_paths": ["my-package/**"],
-     "blocked_paths": ["secrets/**", "*.pem", ".env*"],
-     "force_push": "deny",
-     "block_tags": true,
-     "block_deletes": true,
-     "bypass_protected": false
-   }
-   ```
-3. The `default` entry (unknown remotes) blocks everything — always add explicit entries
-
-### Using HOUSE_GATE when committing from an agent
-
-```bash
-# Minimal: declare clean state
-HOUSE_GATE='{"subagents_running":false}' git commit -m "fix: typo"
-
-# Full: declare clean state + locked decisions + tier floor
-HOUSE_GATE='{"subagents_running":false,"locked_decisions":"React per PRD §5. TypeScript strict. REST API only.","tier_floor":"standard"}' git commit -m "feat: user dashboard"
-```
-
-### How to bypass House in an emergency
-
-| Situation | Bypass method | Audit trail |
-|-----------|--------------|-------------|
-| **Urgent hotfix** — can't wait for review | `HOUSE_BYPASS=1 git commit` | Logged to `house-commits.jsonl` as BYPASSED |
-| **Pre-push blocking wrong files** — false positive | `HOUSE_BYPASS=1 git push` | Logged to `house-commits.jsonl` |
-| **`bypass_protected: true` remote** — HOUSE_BYPASS won't work | Fix the files or update `patients.json` | Bypass blocked entirely — cannot skip |
-| **Production incident** — need emergency deploy | `HOUSE_BYPASS=1 git push` (if remote allows it) | Full audit trail preserved |
-
-**Warning:** `HOUSE_BYPASS` is logged permanently. Every bypass entry is visible in `~/.everybody-lies/reviews/house-commits.jsonl`. There is no "silent bypass."
-
-### How to appeal a P2 finding (Wilson)
-
-```bash
-# Appeal the most recent rejection
-everybody-lies --appeal "The finding is inapplicable — the schema change is intentional and no clients are affected"
-
-# Appeal a specific RFC by ID
-everybody-lies --appeal "justification" --rfc RFC-2026-06-01-pre-commit-review-routes.py
-```
-
-Wilson requires a **different provider** than the review board (separation of powers). Set `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY` to enable appeals. Single-provider setups can't run Wilson.
-
-### Fleet installation (updating all nodes)
-
-```bash
-# On each node in the fleet:
-cd /path/to/everybody-lies
-git pull --rebase origin main
-pip install -e .
-
-# Update hooks in your repos
-cp docs/hooks/pre-push /path/to/repo/.git/hooks/pre-push
-chmod +x /path/to/repo/.git/hooks/pre-push
-```
-
-Or use `git submodule update --remote` if everybody-lies is a git submodule.
-
-## The Fine Print
-
-- **Zero dependencies.** Standard library only. House doesn't need your npm nightmare.
-- **Python 3.10+.**
-- **MIT licensed.** House doesn't care about licenses. He cares about your code.
-- **No telemetry.** House judges you silently. The cloud doesn't need to know.
-- **Exit code 0** = APPROVED. **Exit code 1** = REJECTED. Your CI/CD pipeline knows what to do.
-
 ---
 
-*"Everybody lies. Code especially. House just proves it faster."*
+Exit 0 = APPROVED. Exit 1 = REJECTED. House judges silently; the cloud doesn't need to know.
 
-*"It's a basic truth of the human condition that everybody lies. The only variable is about what. Code is the same — the bug is always where you're not looking."*
+*"Everybody lies. Code especially. House just proves it faster."*
