@@ -18,6 +18,110 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+
+def _count_running_opencode_subagents() -> int:
+    """Return the number of running opencode processes that are NOT ancestors of
+    the current process (i.e. stale subagents, not the caller's own session).
+
+    Uses psutil when available for reliable cross-platform results; falls back
+    to a subprocess-based approach on Windows and POSIX.
+
+    The caller's own opencode session (the one that invoked House via pre-commit)
+    is an ancestor of this process — we exclude the entire ancestor chain so we
+    never block a legitimate commit triggered from inside opencode.
+    """
+    import os
+
+    # Build the set of ancestor PIDs so we never flag the calling session.
+    ancestor_pids: set[int] = set()
+    try:
+        pid = os.getpid()
+        while pid:
+            ancestor_pids.add(pid)
+            # Read parent PID from /proc (Linux/macOS) or via psutil
+            try:
+                import psutil  # type: ignore
+                parent = psutil.Process(pid).parent()
+                pid = parent.pid if parent else 0
+            except Exception:
+                # Fallback: stop ancestor walk — we'll at least exclude self
+                break
+    except Exception:
+        ancestor_pids.add(os.getpid())
+
+    try:
+        import psutil  # type: ignore
+        count = 0
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if "opencode" in proc.info["name"].lower():
+                    if proc.info["pid"] not in ancestor_pids:
+                        count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                pass
+        return count
+    except ImportError:
+        pass
+
+    # psutil unavailable — use platform subprocess fallback
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq opencode.exe", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = [l for l in result.stdout.strip().splitlines() if "opencode" in l.lower()]
+        else:
+            result = subprocess.run(
+                ["pgrep", "-x", "opencode"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = result.stdout.strip().splitlines()
+
+        # Exclude ancestors
+        pids = set()
+        for line in lines:
+            try:
+                pid_str = line.strip().strip('"').split(",")[1].strip('"') if sys.platform == "win32" else line.strip()
+                pid = int(pid_str)
+                if pid not in ancestor_pids:
+                    pids.add(pid)
+            except (ValueError, IndexError):
+                pass
+        return len(pids)
+    except Exception:
+        return 0  # can't detect — don't block
+
+
+def _check_no_running_subagents() -> None:
+    """Cuddy pre-flight: block the commit if stale opencode subagents are running.
+
+    Stale subagents hold RAM, may have uncommitted changes in flight, and can
+    race with this commit. Cuddy refuses to sign off while the house is on fire.
+
+    Skipped when HOUSE_BYPASS is set.
+    """
+    if os.environ.get("HOUSE_BYPASS"):
+        return
+    count = _count_running_opencode_subagents()
+    if count > 0:
+        print(f"\n{'=' * 70}", file=sys.stderr)
+        print(f"  [CUDDY — PRE-FLIGHT BLOCKED]", file=sys.stderr)
+        print(f"  Dr. Lisa Cuddy, Dean of Medicine", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"  {count} running opencode subagent(s) detected.", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"  Committing while subagents are running is like performing surgery", file=sys.stderr)
+        print(f"  during a fire drill. Those agents may have uncommitted changes,", file=sys.stderr)
+        print(f"  in-flight file edits, or unfinished builds that will conflict.", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"  Wait for all subagents to finish, then commit.", file=sys.stderr)
+        print(f"  Or set HOUSE_BYPASS=1 if you know what you're doing.", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"{'=' * 70}", file=sys.stderr)
+        sys.exit(1)
+
 from .config import (
     get_config_dir,
     get_chart_path,
@@ -887,6 +991,9 @@ def run_review(
 
     # Ensure config directory exists
     ensure_config_dir()
+
+    # ── Cuddy pre-flight: no stale subagents ─────────────────────────────
+    _check_no_running_subagents()
 
     board = _load_json(get_chart_path())
     house_config = board["gatekeeper"]
