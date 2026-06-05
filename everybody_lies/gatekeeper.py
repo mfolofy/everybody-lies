@@ -100,9 +100,19 @@ def _check_no_running_subagents() -> None:
     race with this commit. Cuddy refuses to sign off while the house is on fire.
 
     Skipped when HOUSE_BYPASS is set.
+
+    HOUSE_GATE can declare subagents_running=true (block) or false (skip scan).
     """
     if os.environ.get("HOUSE_BYPASS"):
         return
+    gate = _parse_house_gate()
+    if gate.get("subagents_running") is True:
+        print("\n[CUDDY] HOUSE_GATE declares subagents_running=true — commit blocked.", file=sys.stderr)
+        print("[CUDDY] Wait for all subagents to finish, then commit.", file=sys.stderr)
+        sys.exit(1)
+    if gate.get("subagents_running") is False:
+        return  # agent explicitly says clean — skip process scan
+    # Not declared — fall back to process scan (existing logic below)
     count = _count_running_opencode_subagents()
     if count > 0:
         print(f"\n{'=' * 70}", file=sys.stderr)
@@ -118,9 +128,43 @@ def _check_no_running_subagents() -> None:
         print(f"", file=sys.stderr)
         print(f"  Wait for all subagents to finish, then commit.", file=sys.stderr)
         print(f"  Or set HOUSE_BYPASS=1 if you know what you're doing.", file=sys.stderr)
+        print(f"  Or set HOUSE_GATE with subagents_running=false to skip this check.", file=sys.stderr)
         print(f"", file=sys.stderr)
         print(f"{'=' * 70}", file=sys.stderr)
         sys.exit(1)
+
+
+_HOUSE_GATE_CACHE: dict | None = None
+
+
+def _parse_house_gate() -> dict:
+    """Parse HOUSE_GATE env var. Returns empty dict if absent or invalid.
+    Cached after first call — call freely without re-parsing os.environ.
+
+    Keys:
+      subagents_running: bool — true=block commit, false=skip process scan
+      locked_decisions: str — injected into Cuddy prompt as ground truth
+      tier_floor: fast|standard|adversarial — minimum tier floor
+    """
+    global _HOUSE_GATE_CACHE
+    if _HOUSE_GATE_CACHE is not None:
+        return _HOUSE_GATE_CACHE
+    raw = os.environ.get("HOUSE_GATE", "").strip()
+    if not raw:
+        _HOUSE_GATE_CACHE = {}
+        return _HOUSE_GATE_CACHE
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            print("[HOUSE-GATE] WARNING: HOUSE_GATE must be a JSON object — ignored", file=sys.stderr)
+            _HOUSE_GATE_CACHE = {}
+        else:
+            _HOUSE_GATE_CACHE = data
+    except json.JSONDecodeError as e:
+        print(f"[HOUSE-GATE] WARNING: invalid JSON in HOUSE_GATE ({e}) — ignored", file=sys.stderr)
+        _HOUSE_GATE_CACHE = {}
+    return _HOUSE_GATE_CACHE
+
 
 # ── Pre-push patient file — scope enforcement ────────────────────────────────
 #
@@ -176,6 +220,48 @@ def _load_patients_config() -> dict:
         print(f"[HOUSE] WARNING: patients.json load failed ({exc}) — using block-all default",
               file=sys.stderr)
         return _fallback
+
+
+def _find_locked_decisions_from_repo() -> str:
+    """Auto-detect locked decisions from repo spec files for Cuddy injection.
+
+    Searches for CHARTER.md, PHASE*_PRD.md, *_SPEC.md near repo root.
+    Extracts sections headed: Locked Decisions, Non-Negotiable, LOCKED DECISIONS.
+    Returns combined text (capped at 5 files, 800 chars per section).
+    Returns empty string if no files found or git not available.
+    """
+    import glob as _glob
+    try:
+        repo_root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return ""
+
+    candidates = []
+    for pat in ["CHARTER.md", "PHASE*_PRD.md", "*_SPEC.md",
+                "docs/PHASE*_PRD.md", "docs/*_SPEC.md", "projects/*/CHARTER.md"]:
+        candidates.extend(_glob.glob(os.path.join(repo_root, pat)))
+    candidates = candidates[:5]  # cap to keep prompt bounded
+
+    _section_re = re.compile(
+        r"^#{1,3}\s+(locked\s+decisions?|non.negotiable|phase\s+\d+.*decisions?)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    sections = []
+    for path in candidates:
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="ignore")
+            for match in _section_re.finditer(content):
+                chunk = content[match.start(): match.start() + 800]
+                next_h = re.search(r"\n#{1,3}\s+", chunk[1:])
+                if next_h:
+                    chunk = chunk[: next_h.start() + 1]
+                sections.append(f"[{os.path.basename(path)}]\n{chunk.strip()}\n")
+        except Exception:
+            continue
+
+    return "\n\n".join(sections)
 
 
 def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
@@ -855,6 +941,35 @@ def _recommend_tier(risk_score: float) -> str:
         return "adversarial"
 
 
+def _calculate_tier_floor(files: list[str], risk_score: float, board: dict) -> str:
+    """Calculate minimum required tier from file patterns and risk score.
+
+    Returns highest required tier (adversarial > standard > fast).
+    Never returns lower than what risk_score alone recommends.
+    """
+    from .scanner import _match_file_pattern
+
+    _tier_rank = {"fast": 0, "standard": 1, "adversarial": 2}
+    _rank_tier = {0: "fast", 1: "standard", 2: "adversarial"}
+    floor_rank = 0
+
+    tier_floors_cfg = board.get("tier_floors", {})
+
+    for rule in tier_floors_cfg.get("file_patterns", []):
+        pattern = rule.get("pattern", "")
+        min_tier = rule.get("min_tier", "fast")
+        for f in files:
+            if _match_file_pattern(f, pattern):
+                floor_rank = max(floor_rank, _tier_rank.get(min_tier, 0))
+                break  # one match per rule is enough
+
+    for rule in tier_floors_cfg.get("risk_score_floors", []):
+        if risk_score >= rule.get("min_score", 999):
+            floor_rank = max(floor_rank, _tier_rank.get(rule.get("min_tier", "fast"), 0))
+
+    return _rank_tier[floor_rank]
+
+
 def _build_output_paths(title: str) -> tuple[Path, Path]:
     """Build output file paths for markdown and JSON reports."""
     reviews_dir = get_reviews_dir()
@@ -1367,6 +1482,17 @@ def run_review(
         except Exception as exc:
             print(f"  [SPEC] Failed to load {spec_file}: {exc}")
 
+    # Auto-inject locked decisions when no spec provided via --spec or HOUSE_GATE
+    if not spec_content:
+        auto_locked = _find_locked_decisions_from_repo()
+        if auto_locked:
+            spec_content = (
+                "AUTO-DETECTED LOCKED DECISIONS "
+                "(pre-approved — do not re-litigate these in your diagnosis):\n\n"
+                + auto_locked
+            )
+            print("  [CUDDY] Auto-injected locked decisions from repo spec files")
+
     # ── Cuddy — Differential Diagnosis (PRE-REVIEW) ──────────────────
     # Cuddy runs FIRST, before any specialist. She reviews the FULL diff
     # (not domain-filtered) because her job is approach validation, not bug hunting.
@@ -1378,6 +1504,17 @@ def run_review(
         print(f"\n  [CUDDY — DIFFERENTIAL DIAGNOSIS] {cuddy_spec['name']} ({cuddy_spec['title']})")
         print(f"  Ruling out simpler alternatives before the specialists touch this...")
         print(f"  Model: {cuddy_model}")
+
+        # ── Inject HOUSE_GATE locked_decisions into Cuddy context ─────────
+        gate = _parse_house_gate()
+        locked = gate.get("locked_decisions", "")
+        if locked:
+            gate_context = f"LOCKED DECISIONS (pre-approved by orchestrator — do not re-litigate):\n{locked}"
+            if spec_content:
+                spec_content = f"{spec_content}\n\n{gate_context}"
+            else:
+                spec_content = gate_context
+            print(f"  [HOUSE-GATE] Injected locked_decisions into Cuddy context")
 
         try:
             cuddy_id, cuddy_model_used, cuddy_response = _call_cuddy(
