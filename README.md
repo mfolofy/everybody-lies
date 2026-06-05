@@ -14,17 +14,12 @@
 
 ## Why This Exists — What It Feels Like When AI Gets It Wrong
 
-You wake at 2 a.m. because a deploy just failed in production. The logs show every query on a critical table is doing a full scan. The migration that dropped the indexes compiled, all 22 tests passed, and the agent moved on. You realize the data layer is now live and broken.
+Pre-commit review: catches the logic that passes every test and still drops the indexes in prod.
+Cuddy pre-flight: blocks the commit when the other agent is still mid-edit and hasn't pushed.
+Pre-push patient file: stops the monorepo (secrets included) from landing on the wrong remote.
+HOUSE_GATE: forces the agent to declare its actual intent so the rest of the system isn't guessing from a diff.
 
-Or you open GitHub and see your entire monorepo in a clean public repo you never created. Secrets/, agents/, every credential and infrastructure map are sitting there because the push only checked code style, not what files were leaving the machine.
-
-Or two agents were running in parallel, one halfway through a refactor, the other mid-build loop. A commit landed with partial state from the unfinished session. It looked clean. It wasn't.
-
-House exists because tests only prove the code runs what the author thought to test. They miss JWT secrets loadable from committed YAML. They miss a table recreate that silently destroys performance. They miss the moment an agent decides to push the whole repo somewhere it shouldn't.
-
-The pre-commit review stops the logic, security, and approach errors that pass every local check. Cuddy's pre-flight blocks the commit when other agents still have uncommitted work in flight. The pre-push patient file catches the files that should never leave before the push happens. HOUSE_GATE lets the agent say "I'm clean, here's my context" instead of forcing House to guess.
-
-You want it running before every commit, not after, because finding the damage at 2 a.m. is too late.
+Because "it worked on my run" has already cost real data.
 
 ---
 
