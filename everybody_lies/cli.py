@@ -10,6 +10,9 @@ Usage:
     everybody-lies --ci github-actions            # CI mode: GitHub Actions annotations
     everybody-lies --spec                         # Auto-detect and use SPEC.md for Cuddy
     everybody-lies --pre-push --remote origin     # Pre-push scope check (called by git hook)
+
+    # With HOUSE_GATE context (agents set env vars before committing):
+    HOUSE_GATE='{"subagents_running":false,"locked_decisions":"React per PRD §5","tier_floor":"standard"}' everybody-lies --staged
 """
 
 import argparse
