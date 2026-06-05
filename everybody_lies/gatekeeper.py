@@ -224,44 +224,53 @@ def _load_patients_config() -> dict:
 
 def _find_locked_decisions_from_repo() -> str:
     """Auto-detect locked decisions from repo spec files for Cuddy injection.
-
-    Searches for CHARTER.md, PHASE*_PRD.md, *_SPEC.md near repo root.
-    Extracts sections headed: Locked Decisions, Non-Negotiable, LOCKED DECISIONS.
-    Returns combined text (capped at 5 files, 800 chars per section).
-    Returns empty string if no files found or git not available.
+    
+    Searches for PHASE*_PRD.md, CHARTER.md, *_SPEC.md in the repo root and
+    docs/ directory. Extracts sections named:
+      ## Locked Decisions
+      ## Locked decisions  
+      ## Phase X decisions
+      ## Non-negotiable
+      ## LOCKED DECISIONS
+    
+    Returns combined text of all found sections, or empty string if none found.
+    Called automatically when --spec is not provided and HOUSE_GATE locked_decisions
+    is not set.
     """
-    import glob as _glob
     try:
         repo_root = subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"], stderr=subprocess.DEVNULL
         ).decode().strip()
     except Exception:
         return ""
-
+    
+    # Files to search, in priority order
     candidates = []
-    for pat in ["CHARTER.md", "PHASE*_PRD.md", "*_SPEC.md",
-                "docs/PHASE*_PRD.md", "docs/*_SPEC.md", "projects/*/CHARTER.md"]:
-        candidates.extend(_glob.glob(os.path.join(repo_root, pat)))
-    candidates = candidates[:5]  # cap to keep prompt bounded
-
-    _section_re = re.compile(
-        r"^#{1,3}\s+(locked\s+decisions?|non.negotiable|phase\s+\d+.*decisions?)",
-        re.IGNORECASE | re.MULTILINE,
-    )
+    for pattern in ["CHARTER.md", "PHASE*_PRD.md", "*_SPEC.md", "docs/PHASE*_PRD.md", "docs/*_SPEC.md"]:
+        import glob as _glob
+        candidates.extend(_glob.glob(os.path.join(repo_root, pattern)))
+    
     sections = []
-    for path in candidates:
+    _section_headers = re.compile(
+        r"^#{1,3}\s+(locked\s+decisions?|non.negotiable|phase\s+\d+\s+decisions?|locked\s+decisions?\s*\(.*\))",
+        re.IGNORECASE | re.MULTILINE
+    )
+    
+    for path in candidates[:5]:  # cap at 5 files to avoid huge prompts
         try:
             content = Path(path).read_text(encoding="utf-8", errors="ignore")
-            for match in _section_re.finditer(content):
-                chunk = content[match.start(): match.start() + 800]
-                next_h = re.search(r"\n#{1,3}\s+", chunk[1:])
-                if next_h:
-                    chunk = chunk[: next_h.start() + 1]
-                sections.append(f"[{os.path.basename(path)}]\n{chunk.strip()}\n")
+            for match in _section_headers.finditer(content):
+                start = match.start()
+                # Extract until next same-level heading or EOF (max 800 chars)
+                rest = content[start:start + 800]
+                next_heading = re.search(r"\n#{1,3}\s+", rest[1:])
+                if next_heading:
+                    rest = rest[:next_heading.start() + 1]
+                sections.append(f"[From {os.path.basename(path)}]\n{rest.strip()}")
         except Exception:
             continue
-
-    return "\n\n".join(sections)
+    
+    return "\n\n".join(sections) if sections else ""
 
 
 def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
@@ -1497,16 +1506,12 @@ def run_review(
         except Exception as exc:
             print(f"  [SPEC] Failed to load {spec_file}: {exc}")
 
-    # Auto-inject locked decisions when no spec provided via --spec or HOUSE_GATE
+    # Auto-inject locked decisions if not already provided via --spec or HOUSE_GATE
     if not spec_content:
         auto_locked = _find_locked_decisions_from_repo()
         if auto_locked:
-            spec_content = (
-                "AUTO-DETECTED LOCKED DECISIONS "
-                "(pre-approved — do not re-litigate these in your diagnosis):\n\n"
-                + auto_locked
-            )
-            print("  [CUDDY] Auto-injected locked decisions from repo spec files")
+            spec_content = f"AUTO-DETECTED LOCKED DECISIONS (do not re-litigate these):\n{auto_locked}"
+            print(f"  [CUDDY] Auto-injected locked decisions from repo spec files")
 
     # ── Cuddy — Differential Diagnosis (PRE-REVIEW) ──────────────────
     # Cuddy runs FIRST, before any specialist. She reviews the FULL diff
