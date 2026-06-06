@@ -187,6 +187,13 @@ def main() -> None:
         from .scanner import emit_ci_output
         emit_ci_output(result, args.ci, args.output if args.output else None)
 
+    # Write result JSON so pre-commit hook can read back the rfc_id for SHA stamping
+    if args.output and isinstance(result, dict):
+        import json as _json
+        from pathlib import Path as _Path
+        _Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        _Path(args.output).write_text(_json.dumps(result), encoding="utf-8")
+
     # Exit code: non-zero if REJECTED (so pre-commit hooks can block)
     if not isinstance(result, dict):
         print("ERROR: run_review returned unexpected type", file=sys.stderr)
