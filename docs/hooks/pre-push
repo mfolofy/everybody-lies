@@ -13,13 +13,18 @@ if [ -z "$REPO_ROOT" ]; then
   exit 0
 fi
 
-PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
-if [ -z "$PYTHON" ]; then
-  echo "[HOUSE] WARNING: python not found — pre-push scope check skipped" >&2
-  exit 0
-fi
+# Try python first (has real packages on Windows), then python3 as fallback.
+# Validates the chosen Python can actually import everybody_lies.
+PYTHON=""
+for candidate in python python3; do
+  PYTHON="$(command -v "$candidate" 2>/dev/null)"
+  if [ -n "$PYTHON" ] && "$PYTHON" -c "import everybody_lies" 2>/dev/null; then
+    break
+  fi
+  PYTHON=""
+done
 
-if ! "$PYTHON" -c "import everybody_lies" 2>/dev/null; then
+if [ -z "$PYTHON" ]; then
   echo "[HOUSE] WARNING: everybody_lies not installed — pre-push scope check skipped" >&2
   exit 0
 fi
