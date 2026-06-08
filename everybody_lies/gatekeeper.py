@@ -1956,14 +1956,13 @@ def _get_appeal_model(board: dict) -> str | None:
             if provider and os.environ.get(provider["env_key"]):
                 return model
 
-    # Step 3: any available direct provider, no openrouter
+    # Step 3: any available direct provider — no openrouter, no gemini (key invalid 2026-06-08)
     _PROVIDER_BEST_MODEL = {
         "deepseek":  "deepseek-v4-flash",
-        "gemini":    "gemini-2.5-flash",
         "anthropic": "claude-sonnet-4-6",
     }
     for provider_key in detect_available_providers():
-        if provider_key != "openrouter" and provider_key in _PROVIDER_BEST_MODEL:
+        if provider_key not in ("openrouter", "gemini") and provider_key in _PROVIDER_BEST_MODEL:
             return _PROVIDER_BEST_MODEL[provider_key]
 
     return None
