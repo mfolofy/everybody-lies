@@ -246,7 +246,7 @@ def _find_locked_decisions_from_repo() -> str:
     
     # Files to search, in priority order
     candidates = []
-    for pattern in ["CHARTER.md", "PHASE*_PRD.md", "*_SPEC.md", "docs/PHASE*_PRD.md", "docs/*_SPEC.md"]:
+    for pattern in ["SCOPE.md", "CHARTER.md", "PHASE*_PRD.md", "*_SPEC.md", "docs/SCOPE_MANDATE.md", "docs/PHASE*_PRD.md", "docs/*_SPEC.md"]:
         import glob as _glob
         candidates.extend(_glob.glob(os.path.join(repo_root, pattern)))
     
@@ -1549,8 +1549,12 @@ def run_review(
                 "files_reviewed": files,
                 "pre_review": True,
             }
-            # Check Cuddy's findings for blockers
-            if "P1" in cuddy_response or "P1:" in cuddy_response:
+            # Check Cuddy's findings for blockers.
+            # Use the same regex patterns as specialist checks — naive "P1" string
+            # match fires on summary lines like "P1 (blocking): 0" even when Cuddy passes.
+            _cuddy_p1 = any(re.search(p, cuddy_response, re.MULTILINE | re.IGNORECASE)
+                            for p in _p1_patterns)
+            if _cuddy_p1:
                 blocking_findings.append(f"Cuddy: P1 — simpler alternative exists, approach is wrong")
                 all_pass = False
             elif "FAIL" in cuddy_response[:500] or "FAIL" in cuddy_response.upper()[:200]:
@@ -1927,45 +1931,41 @@ def _find_latest_rejected_review() -> Path | None:
 def _get_appeal_model(board: dict) -> str | None:
     """Resolve the model for Wilson (appeal judge).
 
-    MUST be a different PROVIDER than the review board uses.
-    DeepSeek is excluded — it's the review board's provider.
-
+    OpenRouter is BANNED for Wilson — automated workflows burned $100 in 2 days.
     Resolution order:
-    1. chart.json appeal_judge.model — if its provider is available and non-deepseek
-    2. chart.json appeal_judge.fallback_models — same check
-    3. Any available non-deepseek provider from detect_available_providers()
-       using its best direct model (anthropic → claude-sonnet-4-6,
-       gemini → gemini-2.5-flash, openrouter → google/gemini-2.5-flash)
+    1. chart.json appeal_judge.model — use if provider key is available
+    2. chart.json appeal_judge.fallback_models — same check, skip openrouter
+    3. Any available direct provider (deepseek → gemini → anthropic), never openrouter
 
-    Returns None only if NO non-deepseek provider has a key.
+    Returns None only if no provider key is available at all.
     """
     from .providers import MODEL_ROUTING, PROVIDERS, detect_available_providers
 
     appeal_config = board.get("appeal_judge", {})
-    primary = appeal_config.get("model", "gemini-2.5-flash")
+    primary = appeal_config.get("model", "deepseek-v4-flash")
     fallbacks = appeal_config.get("fallback_models",
-        ["gemini-2.5-flash", "claude-sonnet-4-6", "anthropic/claude-sonnet-4-6",
-         "google/gemini-2.5-flash", "openai/gpt-4o"])
+        ["deepseek-chat", "gemini-2.5-flash", "claude-sonnet-4-6"])
 
-    # Step 1+2: try chart-configured models
+    # Step 1+2: try chart-configured models — skip openrouter provider
     for model in [primary] + fallbacks:
-        route = MODEL_ROUTING.get(model, ["openrouter"])
+        route = MODEL_ROUTING.get(model, [])
         for provider_key in route:
+            if provider_key == "openrouter":
+                continue  # never use openrouter for Wilson
             provider = PROVIDERS.get(provider_key)
-            if provider and provider_key != "deepseek" and os.environ.get(provider["env_key"]):
+            if provider and os.environ.get(provider["env_key"]):
                 return model
 
-    # Step 3: fall back to any available non-deepseek provider
+    # Step 3: any available direct provider, no openrouter
     _PROVIDER_BEST_MODEL = {
-        "anthropic": "claude-sonnet-4-6",
+        "deepseek":  "deepseek-v4-flash",
         "gemini":    "gemini-2.5-flash",
-        "openrouter": "google/gemini-2.5-flash",
+        "anthropic": "claude-sonnet-4-6",
     }
     for provider_key in detect_available_providers():
-        if provider_key != "deepseek" and provider_key in _PROVIDER_BEST_MODEL:
+        if provider_key != "openrouter" and provider_key in _PROVIDER_BEST_MODEL:
             return _PROVIDER_BEST_MODEL[provider_key]
 
-    # No independent judge available — appeal cannot proceed
     return None
 
 
