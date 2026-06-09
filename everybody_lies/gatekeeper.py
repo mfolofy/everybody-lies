@@ -1519,6 +1519,11 @@ def run_review(
     cuddy_spec = next((s for s in specialists if s.get("pre_review") and s["id"] == "cuddy"), None)
     cuddy_finding: dict | None = None
 
+    # Declare before the Cuddy block — used inside Cuddy's try AND in the
+    # specialist loop below. Assignment at 1576 makes Python treat it as local;
+    # without this initializer the Cuddy try block raises UnboundLocalError.
+    _p1_patterns: list[str] = []
+
     if cuddy_spec and diff_text.strip():
         cuddy_model = resolve_specialist_model(cuddy_spec, tier, board)
         print(f"\n  [CUDDY — DIFFERENTIAL DIAGNOSIS] {cuddy_spec['name']} ({cuddy_spec['title']})")
