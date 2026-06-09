@@ -1,4 +1,4 @@
-"""House Diagnostics — Ghost-wide performance tracking for review participants.
+"""House Diagnostics — Performance tracking for review participants.
 
 Tracks Diagnostic scores (0-100) for every agent, specialist, and Cuddy.
 Detects review loops and triggers Cuddy tiebreak based on daily grades.
@@ -6,7 +6,7 @@ Detects review loops and triggers Cuddy tiebreak based on daily grades.
 Score storage: docs/reviews/diagnostics/ledger.json (repo-resident, syncs on git pull)
 
 Identity model:
-  - Hermes agents: resolved from Co-Authored-By commit attribution (static identity)
+  - internal agents: resolved from Co-Authored-By commit attribution (static identity)
   - OpenCode/Claude Code agents: session-declared "Agent (Framework / model-id) — role"
   - Specialists (Foreman, Taub, Cuddy, etc.): keyed by name + model
 
@@ -91,7 +91,7 @@ def format_score(score: float) -> str:
 
 # ── Identity parsing ──────────────────────────────────────────────────────────
 
-# Parses "Mike (Claude Code / claude-sonnet-4-6)" or "Samuel (Hermes/Tiger)"
+# Parses "AgentName (Framework / model-id)" or "AgentName (Framework/node)"
 _IDENTITY_RE = re.compile(
     r"(?P<name>\w+)\s*\((?P<framework>[^/]+)/\s*(?P<model_or_node>[^)]+)\)"
 )
@@ -104,7 +104,7 @@ def parse_attribution(coauthored_by: str) -> dict:
     name = m.group("name").strip()
     framework = m.group("framework").strip()
     model_or_node = m.group("model_or_node").strip()
-    # Hermes agents: node name (Tiger, Mako, VPS). Others: model id.
+    # Internal agents: node identifier (node-1, node-2, node-3). Others: model id.
     is_hermes = framework.lower() == "hermes"
     key = f"{name}/{framework}/{model_or_node}"
     return {

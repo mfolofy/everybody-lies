@@ -6,7 +6,7 @@
 **Severity:** High — causes infinite review loop on valid code  
 **Symptom:** Cuddy (differential diagnosis) generates new P1/P2 findings on each round that contradict her prior rulings on the same diff.
 
-**Observed sequence on `email_watch.py` ZipRecruiter feature:**
+**Observed sequence on `example_feature.py` feature:**
 - Round 1: Rejected — "use shared constants (LI_SALARY_MIN), not separate ones"
 - Round 2: Rejected — "separate constants are duplication, use shared ones" *(same finding, different framing)*
 - Round 3: **PASS** — accepted iterative line-by-line parsing with docstring justification

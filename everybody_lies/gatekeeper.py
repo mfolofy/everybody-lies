@@ -170,7 +170,7 @@ def _parse_house_gate() -> dict:
 #
 # Design decisions (pre-ruled-out alternatives):
 #
-# 1. Not server-side: we do not control CI on external remotes (shiftctl, etc.).
+# 1. Not server-side: we do not control CI on external remotes (some-external-remote, etc.).
 #    Server-side is ideal long-term; client-side is the only option available now.
 #
 # 2. Not shell-only: this fleet runs Windows + macOS + Linux. Shell glob matching

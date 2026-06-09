@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **HOUSE_GATE** env var: agents declare `subagents_running`, `locked_decisions`, `tier_floor` before committing. Cached after first parse. Injected into Cuddy prompt and tier calculation.
-- **Tier floor enforcement**: file patterns (`**/migrations/**`, `**/auth/**`, `**/trading_core/**`, `**/secrets/**`) and risk score (≥ 4.0 → adversarial, ≥ 2.5 → standard) auto-upgrade minimum review tier. Configurable in `chart.json` → `tier_floors`.
+- **Tier floor enforcement**: file patterns (`**/migrations/**`, `**/auth/**`, `**/financial/**`, `**/secrets/**`) and risk score (≥ 4.0 → adversarial, ≥ 2.5 → standard) auto-upgrade minimum review tier. Configurable in `chart.json` → `tier_floors`.
 - **Cuddy PRD auto-injection**: auto-detects `CHARTER.md`, `PHASE*_PRD.md`, `*_SPEC.md` near repo root. Extracts "Locked Decisions" / "Non-negotiable" / "Phase X decisions" sections. Injects into Cuddy system prompt as ground truth. Eliminates false positives from re-litigating approved design decisions.
 - **Patient file pre-push scope enforcement**: `.house/patients.json` declares per-remote file scope (`allowed_paths`, `blocked_paths` globs). `force_push`, `block_tags`, `block_deletes` policies. Unknown remotes blocked by default. Precedence: `blocked_paths` always wins.
 - `docs/hooks/pre-push`: install script with Python/package availability guards. Falls back gracefully when python isn't available.

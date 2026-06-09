@@ -5,7 +5,7 @@ MOCK_BOARD = {
     "tier_floors": {
         "file_patterns": [
             {"pattern": "**/migrations/**",   "min_tier": "standard"},
-            {"pattern": "**/trading_core/**", "min_tier": "adversarial"},
+            {"pattern": "**/financial/**", "min_tier": "adversarial"},
             {"pattern": "**/secrets/**",      "min_tier": "adversarial"},
         ],
         "risk_score_floors": [
@@ -24,7 +24,7 @@ def test_migration_file_gets_standard():
 
 def test_trading_core_gets_adversarial():
     from everybody_lies.gatekeeper import _calculate_tier_floor
-    result = _calculate_tier_floor(["trading_core/bot.py"], 1.0, MOCK_BOARD)
+    result = _calculate_tier_floor(["financial/bot.py"], 1.0, MOCK_BOARD)
     assert result == "adversarial"
 
 
@@ -48,7 +48,7 @@ def test_docs_file_no_floor():
 
 def test_no_tier_floors_config():
     from everybody_lies.gatekeeper import _calculate_tier_floor
-    result = _calculate_tier_floor(["trading_core/bot.py"], 4.5, {})
+    result = _calculate_tier_floor(["financial/bot.py"], 4.5, {})
     assert result == "fast"  # no config = no floor
 
 
@@ -56,7 +56,7 @@ def test_higher_pattern_wins():
     from everybody_lies.gatekeeper import _calculate_tier_floor
     # Both migration (standard) and trading_core (adversarial) — adversarial wins
     result = _calculate_tier_floor(
-        ["trading_core/bot.py", "internal/db/migrations/001.sql"], 1.0, MOCK_BOARD
+        ["financial/bot.py", "config/migrations/001.sql"], 1.0, MOCK_BOARD
     )
     assert result == "adversarial"
 

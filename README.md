@@ -166,7 +166,7 @@ House won't let you run `--tier fast` on a database migration. Some files are to
 |---------|----------|-----------|
 | `**/migrations/**`, `**/migrate*.py` | `standard` | Schema changes need careful review |
 | `**/auth/**` | `standard` | Auth bugs are security bugs |
-| `**/trading_core/**`, `**/gs-rev-*/**` | `adversarial` | Financial code = adversarial by default |
+| `**/financial/**`, `**/proprietary-*/**` | `adversarial` | Financial code = adversarial by default |
 | `**/.env*`, `**/secrets/**`, `**/*.pem`, `**/*.key` | `adversarial` | Secrets touching = adversarial |
 
 **Risk score floors** (configured in `chart.json` → `tier_floors.risk_score_floors`):

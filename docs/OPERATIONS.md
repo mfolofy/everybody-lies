@@ -1,7 +1,7 @@
 # everybody-lies — Operations Runbook
 
 > **Version:** 0.3.0 | **Last updated:** 2026-06-05  
-> **Purpose:** Full operational guide for installing, configuring, and operating House across the Ghost Stack fleet.
+> **Purpose:** Full operational guide for installing, configuring, and operating House across multiple machines.
 
 ---
 
@@ -282,7 +282,7 @@ Tier floors are calculated from two sources (highest wins):
 |---------|----------|
 | `**/migrations/**`, `**/migrate*.py`, `**/db/schema*`, `**/db/migrate*` | `standard` |
 | `**/auth/**` | `standard` |
-| `**/trading_core/**`, `**/gs-rev-*/**` | `adversarial` |
+| `**/financial/**`, `**/proprietary/**` | `adversarial` |
 | `**/.env*`, `**/secrets/**`, `**/*.pem`, `**/*.key` | `adversarial` |
 
 **Risk score floors** (`chart.json` → `tier_floors.risk_score_floors`):
@@ -386,8 +386,8 @@ Specialists can override the model per-tier via `model_overrides` in chart.json.
       "block_deletes": false,
       "bypass_protected": false
     },
-    "shiftctl": {
-      "allowed_paths": ["shiftctl/**"],
+    "internal-repo": {
+      "allowed_paths": ["internal-repo/**"],
       "blocked_paths": ["secrets/**", "*.pem"],
       "force_push": "deny",
       "block_tags": true,
@@ -408,7 +408,7 @@ Specialists can override the model per-tier via `model_overrides` in chart.json.
 
 With this config:
 - `origin` → anything goes (except secrets)
-- `shiftctl` → only `shiftctl/` files allowed, secrets blocked, HOUSE_BYPASS can't help
+- `internal-repo` → only `internal-repo/` files allowed, secrets blocked, HOUSE_BYPASS can't help
 - Any other remote → blocked entirely
 
 ---
@@ -563,14 +563,4 @@ python -c "import everybody_lies.config; print(everybody_lies.config.get_chart_p
 everybody-lies --staged --tier fast --dry-run
 ```
 
-### Token sync (Ghost Stack fleet)
 
-For the Ghost Stack fleet specifically, sync API keys across nodes:
-
-```bash
-# From Banana (authority):
-bash AI_Code/scripts/sync/sync_gws_tokens.sh
-
-# Or set on each node individually:
-export EVERYBODY_LIES_API_KEYS='{"DEEPSEEK_API_KEY":"sk-..."}'
-```

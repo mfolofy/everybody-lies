@@ -1,3 +1,17 @@
+# Secrets / sensitive data
+secrets/
+*.env
+*.env.local
+*.env.production
+
+# Logs
+*.log
+
+# Keys / certificates (never commit)
+*.key
+*.pem
+*.cert
+
 # Build artifacts
 dist/
 build/
