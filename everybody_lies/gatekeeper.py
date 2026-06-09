@@ -1579,10 +1579,10 @@ def run_review(
     # Patterns that match actual P1 severity markers in specialist responses.
     # Excludes the summary line "P1 (blocking): 0" that appears in every response.
     _p1_patterns = [
-        r"\*\*Severity:\*\*\s*P1",   # **Severity:** P1
-        r"^-\s+\*\*P1\b",            # - **P1 ...
-        r"Severity.*P1.*blocking",    # Severity: P1 (blocking)
-        r"P1\s*[\(\-–]\s*block", # P1 (blocking) / P1 - blocking / P1 – blocking
+        r"\*\*Severity:\*\*\s*P1",        # **Severity:** P1
+        r"^-\s+\*\*P1\b",                 # - **P1 ...
+        r"Severity.*P1.*blocking",         # Severity: P1 (blocking)
+        r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",  # P1 (blocking) but NOT "P1 (blocking): 0"
     ]
 
     specialist_results: list[dict] = []
