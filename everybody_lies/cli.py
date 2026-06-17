@@ -61,7 +61,9 @@ def main() -> None:
                         choices=["diagnose", "review"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--tier", choices=["fast", "standard", "adversarial"],
-                        default="standard", help="Review tier (default: standard)")
+                        default=None,
+                        help="Review tier. If omitted, House picks the tier from "
+                             "the change's risk score (low risk -> fast).")
     parser.add_argument("--diff", default="", help="Git diff text to review")
     parser.add_argument("--files", default="", help="Comma-separated file paths")
     parser.add_argument("--staged", action="store_true", help="Review staged changes only")
@@ -178,10 +180,16 @@ def main() -> None:
     if args.files:
         files = [f.strip() for f in args.files.split(",") if f.strip()]
 
+    # Distinguish an explicit --tier from the risk-driven default. When the
+    # caller pins a tier, House respects it; otherwise House chooses by risk.
+    tier_explicit = args.tier is not None
+    effective_tier = args.tier if tier_explicit else "standard"
+
     result = run_review(
         diff_text=args.diff,
         files=files,
-        tier=args.tier,
+        tier=effective_tier,
+        tier_explicit=tier_explicit,
         title=args.title,
         change_type=args.change_type,
         staged=args.staged,

@@ -718,6 +718,62 @@ def _filter_diff_for_files(diff_text: str, files: list[str]) -> str:
     return "\n".join(filtered)
 
 
+def _read_full_file(path: str, staged: bool) -> str:
+    """Return the FULL post-change content of a file for reviewer context.
+
+    Reviewers that only see a diff hallucinate "undefined variable" / "runs for
+    every message" claims because the surrounding code isn't visible. Feeding the
+    whole file lets them verify a symbol is actually defined or a call is gated.
+
+    Prefers the staged blob (what's actually being committed); falls back to the
+    working tree. Returns "" on any failure (binary, deleted, too large).
+    """
+    MAX_BYTES = 60_000  # ~15k tokens; skip giant files to bound cost
+    try:
+        if staged:
+            res = subprocess.run(
+                ["git", "show", f":{path}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if res.returncode == 0:
+                content = res.stdout
+            else:
+                content = ""
+        else:
+            content = ""
+        if not content:
+            p = Path(path)
+            if p.exists() and p.is_file():
+                content = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    if not content or len(content.encode("utf-8", "ignore")) > MAX_BYTES:
+        return ""
+    return content
+
+
+def _build_full_file_context(files: list[str], staged: bool) -> str:
+    """Build a 'FULL FILE CONTENTS' block for the given files, for verification."""
+    blocks: list[str] = []
+    for f in files:
+        content = _read_full_file(f, staged)
+        if content:
+            blocks.append(f"### FILE: {f}\n```\n{content}\n```")
+    if not blocks:
+        return ""
+    header = textwrap.dedent("""\
+
+        ───────────────────────────────────────────────────────────
+        FULL FILE CONTENTS (post-change) — for VERIFICATION ONLY
+        Use this to confirm whether a symbol is defined, a call is
+        guarded, or a claim holds BEFORE you flag it. Do NOT flag a
+        symbol as "undefined" or a call as "unguarded" without first
+        checking it here. Review the DIFF above; verify against this.
+        ───────────────────────────────────────────────────────────
+        """)
+    return header + "\n\n".join(blocks)
+
+
 def _call_specialist(spec: dict, model: str, diff_text: str,
                      max_tokens: int) -> tuple[str, str, str]:
     """Call a single specialist. Returns (specialist_id, model_used, response_text)."""
@@ -745,7 +801,16 @@ def _call_specialist(spec: dict, model: str, diff_text: str,
         - **Verdict:** PASS or FAIL
 
         Be specific. Cite exact file paths and line numbers. No hand-waving.
-        If the code is clean, say so and PASS. Do not invent problems.""")
+        If the code is clean, say so and PASS. Do not invent problems.
+
+        VERIFICATION RULE (mandatory before any P1/P2):
+        The message may include a "FULL FILE CONTENTS" section after the diff.
+        Before you claim a symbol is undefined, a call is unguarded, a path is
+        unreachable, or data is lost — find it in the full file and confirm.
+        If you cannot point to the exact line that proves your claim, DOWNGRADE
+        it to P3 and say "unverified". Never block on an unverified claim.
+        If you were not given a file you need, say so as P4 (informational) —
+        a missing file is a routing gap, NOT a code defect, and must not block.""")
 
     response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.4)
     return spec["id"], model, response
@@ -948,6 +1013,136 @@ def _recommend_tier(risk_score: float) -> str:
         return "standard"
     else:
         return "adversarial"
+
+
+_TIER_RANK = {"fast": 0, "standard": 1, "adversarial": 2}
+_RANK_TIER = {0: "fast", 1: "standard", 2: "adversarial"}
+
+
+def _resolve_effective_tier(
+    requested_tier: str,
+    recommended_tier: str,
+    tier_floor: str,
+    tier_explicit: bool,
+) -> str:
+    """Decide the tier the review actually runs at.
+
+    Three inputs compete:
+      - requested_tier:   what the caller/hook passed (often the default "standard")
+      - recommended_tier: what the risk score says is appropriate
+      - tier_floor:       hard minimum from file patterns / risk / HOUSE_GATE
+
+    Rules (in order):
+      1. The floor is a hard minimum — the result is never below it.
+      2. If the caller did NOT explicitly choose a tier (i.e. it's the default),
+         House honors its OWN recommendation rather than blindly running the
+         default. A low-risk one-file utility (risk 1.8 -> "fast") must NOT be
+         forced through the exhaustive "standard" Cuddy differential just because
+         "standard" is the argparse default.
+      3. If the caller DID explicitly choose a tier, respect it (but never below
+         the floor). Explicit > recommendation.
+
+    This fixes the historical bug where the recommended tier was only ever
+    allowed to UPGRADE the run; a lower recommendation was printed as a warning
+    and then ignored, so every commit ran "standard".
+    """
+    floor_rank = _TIER_RANK.get(tier_floor, 0)
+
+    if tier_explicit:
+        chosen_rank = _TIER_RANK.get(requested_tier, 1)
+    else:
+        # Honor House's own recommendation when the caller didn't pin a tier.
+        chosen_rank = _TIER_RANK.get(recommended_tier, 1)
+
+    effective_rank = max(chosen_rank, floor_rank)
+    return _RANK_TIER[effective_rank]
+
+
+def _prior_rulings_context(files: list[str], limit: int = 12) -> str:
+    """Build a 'previously accepted' note from prior APPROVED reviews that touched
+    the same files. Injected into Cuddy's context so the panel doesn't reverse an
+    earlier acceptance without new cause (House once accepted writing to a
+    gitignored .jen/ dir, then later flagged a .jen/ file as a P1 PII breach).
+
+    Best-effort and read-only: any failure returns "".
+    """
+    try:
+        from .config import get_reviews_dir
+        reviews_dir = get_reviews_dir()
+        if not reviews_dir.exists():
+            return ""
+        fileset = set(files)
+        approved: list[str] = []
+        # Newest first so the most recent ruling wins.
+        jsons = sorted(reviews_dir.glob("house-*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for jf in jsons[:60]:
+            try:
+                data = json.loads(jf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if data.get("verdict") != "APPROVED":
+                continue
+            prior_files = set(data.get("affected_files", []))
+            overlap = fileset & prior_files
+            if overlap:
+                title = data.get("change_title", "") or data.get("rfc_id", "")
+                approved.append(f"- {', '.join(sorted(overlap))}: APPROVED ({title})")
+            if len(approved) >= limit:
+                break
+        if not approved:
+            return ""
+        return textwrap.dedent("""\
+            PREVIOUSLY ACCEPTED BY HOUSE (do not reverse without NEW cause):
+            The following files/approaches were APPROVED in earlier rounds.
+            Do not re-litigate a decision House already accepted unless the code
+            changed in a way that introduces a genuinely new problem.
+            """) + "\n".join(approved)
+    except Exception:
+        return ""
+
+
+def _is_routing_gap_complaint(response: str) -> bool:
+    """True when a reviewer is complaining it wasn't given the file/content to
+    review — a routing artifact, not a code defect. Such a response must never
+    block the commit (Dr. Thirteen once raised a P1 'jen_mailbox.py content is
+    missing, cannot review' when routed only .gitignore)."""
+    head = response[:800].lower()
+    phrases = (
+        "content is missing", "cannot review", "can't review", "not provided",
+        "no content", "wasn't given", "was not given", "no code to review",
+        "missing file", "file is missing", "nothing to review", "unable to review",
+    )
+    return any(p in head for p in phrases)
+
+
+def _cuddy_should_block(cuddy_response: str, tier: str, p1_patterns: list[str]) -> bool:
+    """Decide whether Cuddy's differential should HARD-BLOCK the commit.
+
+    Cuddy invents "simpler alternatives you didn't rule out" every round. On a
+    low-risk change that endless approach-level differential is noise, not a
+    gate. Convergence rules:
+
+      - A genuine P1 (an objectively-better approach that OBVIATES the code)
+        always blocks — on every tier.
+      - A bare "FAIL" / approach-level P2 ("a simpler alternative exists") only
+        blocks on the "adversarial" tier. On "fast" and "standard" it is
+        advisory: surfaced in the synthesis, but it does not reject the commit.
+        This stops Cuddy from re-litigating a *different* invented alternative
+        each round (heuristics, a local classifier, tenacity, Apps Script,
+        Zapier...) and never converging on a tiny internal utility.
+    """
+    has_p1 = any(re.search(p, cuddy_response, re.MULTILINE | re.IGNORECASE)
+                 for p in p1_patterns)
+    if has_p1:
+        return True
+
+    fails = "FAIL" in cuddy_response[:500] or "FAIL" in cuddy_response.upper()[:200]
+    if not fails:
+        return False
+
+    # Approach-level FAIL with no P1 -> only an automatic block on adversarial.
+    return tier == "adversarial"
 
 
 def _calculate_tier_floor(files: list[str], risk_score: float, board: dict) -> str:
@@ -1276,6 +1471,7 @@ def run_review(
     diff_text: str = "",
     files: Optional[list[str]] = None,
     tier: str = "standard",
+    tier_explicit: bool = False,
     title: str = "",
     change_type: str = "normal",
     staged: bool = False,
@@ -1346,7 +1542,7 @@ def run_review(
 
     # Enforce tier floor from file patterns + risk score
     tier_floor = _calculate_tier_floor(files, risk_score, board)
-    _tier_rank = {"fast": 0, "standard": 1, "adversarial": 2}
+    _tier_rank = _TIER_RANK
 
     # Also apply HOUSE_GATE tier_floor if present
     gate = _parse_house_gate()
@@ -1354,12 +1550,19 @@ def run_review(
     if gate_tier and _tier_rank.get(gate_tier, 0) > _tier_rank.get(tier_floor, 0):
         tier_floor = gate_tier
 
-    if _tier_rank.get(tier_floor, 0) > _tier_rank.get(tier, 0):
-        print(f"  [HOUSE] Tier upgraded: {tier} -> {tier_floor} (floor from files/risk/gate)")
-        tier = tier_floor
-    elif recommended_tier != tier:
-        # Keep existing mismatch warning when floor doesn't kick in
-        print(f"  [!] Tiers don't match -- Orchestrator chose {tier}, House recommends {recommended_tier}")
+    # Resolve the tier the review actually runs at. Honors House's own
+    # risk-based recommendation when the caller didn't explicitly pin --tier,
+    # and never drops below the hard floor. (Previously the recommendation could
+    # only upgrade, so a 1.8-risk one-file change still ran the exhaustive
+    # "standard" Cuddy differential — 11 review rounds. See _resolve_effective_tier.)
+    requested_tier = tier
+    tier = _resolve_effective_tier(requested_tier, recommended_tier, tier_floor, tier_explicit)
+    if tier != requested_tier:
+        if _tier_rank.get(tier, 0) > _tier_rank.get(requested_tier, 0):
+            print(f"  [HOUSE] Tier upgraded: {requested_tier} -> {tier} (floor from files/risk/gate)")
+        else:
+            print(f"  [HOUSE] Tier set to {tier} per risk {risk_score}/5.0 "
+                  f"(caller passed {requested_tier}, not explicit -> honoring recommendation)")
 
     print(f"\n{'=' * 70}")
     print(f"  HOUSE GATEKEEPER -- Code Review")
@@ -1519,10 +1722,18 @@ def run_review(
     cuddy_spec = next((s for s in specialists if s.get("pre_review") and s["id"] == "cuddy"), None)
     cuddy_finding: dict | None = None
 
-    # Declare before the Cuddy block — used inside Cuddy's try AND in the
-    # specialist loop below. Assignment at 1576 makes Python treat it as local;
-    # without this initializer the Cuddy try block raises UnboundLocalError.
-    _p1_patterns: list[str] = []
+    # Patterns that match actual P1 severity markers in a review response.
+    # Excludes the summary line "P1 (blocking): 0" that appears in every response.
+    # Defined BEFORE the Cuddy block so Cuddy's own P1 detection actually fires —
+    # previously this was an empty list here and only populated after the Cuddy
+    # block, so Cuddy's P1 check was dead code and any "FAIL" (even an advisory
+    # P2 "simpler alternative") hard-blocked the commit on every tier.
+    _p1_patterns = [
+        r"\*\*Severity:\*\*\s*P1",        # **Severity:** P1
+        r"^-\s+\*\*P1\b",                 # - **P1 ...
+        r"Severity.*P1.*blocking",         # Severity: P1 (blocking)
+        r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",  # P1 (blocking) but NOT "P1 (blocking): 0"
+    ]
 
     if cuddy_spec and diff_text.strip():
         cuddy_model = resolve_specialist_model(cuddy_spec, tier, board)
@@ -1541,9 +1752,17 @@ def run_review(
                 spec_content = gate_context
             print(f"  [HOUSE-GATE] Injected locked_decisions into Cuddy context")
 
+        # ── Inject prior APPROVED rulings so House doesn't reverse itself ──
+        prior = _prior_rulings_context(files)
+        if prior:
+            spec_content = f"{spec_content}\n\n{prior}" if spec_content else prior
+            print(f"  [HISTORY] Injected prior APPROVED rulings into Cuddy context")
+
+        _cuddy_full_ctx = _build_full_file_context(files, staged)
+        _cuddy_input = diff_text + ("\n" + _cuddy_full_ctx if _cuddy_full_ctx else "")
         try:
             cuddy_id, cuddy_model_used, cuddy_response = _call_cuddy(
-                cuddy_spec, cuddy_model, diff_text, max_tokens, spec_content,
+                cuddy_spec, cuddy_model, _cuddy_input, max_tokens, spec_content,
             )
             print(f"    -> {len(cuddy_response)} chars received")
             cuddy_finding = {
@@ -1554,16 +1773,18 @@ def run_review(
                 "files_reviewed": files,
                 "pre_review": True,
             }
-            # Check Cuddy's findings for blockers.
-            # Use the same regex patterns as specialist checks — naive "P1" string
-            # match fires on summary lines like "P1 (blocking): 0" even when Cuddy passes.
-            _cuddy_p1 = any(re.search(p, cuddy_response, re.MULTILINE | re.IGNORECASE)
-                            for p in _p1_patterns)
-            if _cuddy_p1:
-                blocking_findings.append(f"Cuddy: P1 — simpler alternative exists, approach is wrong")
+            # Check Cuddy's findings for blockers — tier-aware so approach-level
+            # P2 ("a simpler alternative exists") does NOT hard-block on
+            # fast/standard. Only a genuine P1 (alternative obviates the code)
+            # or an adversarial-tier FAIL blocks. See _cuddy_should_block.
+            if _cuddy_should_block(cuddy_response, tier, _p1_patterns):
+                blocking_findings.append(
+                    "Cuddy: blocking — a simpler approach would obviate this code (not ruled out)"
+                )
                 all_pass = False
-            elif "FAIL" in cuddy_response[:500] or "FAIL" in cuddy_response.upper()[:200]:
-                all_pass = False
+            elif "FAIL" in cuddy_response.upper()[:200]:
+                # Advisory only on fast/standard: surfaced in synthesis, no block.
+                print("    -> Cuddy flagged approach concerns (advisory on this tier, not blocking)")
         except Exception as exc:
             print(f"    -> Cuddy unavailable: {exc}")
             cuddy_finding = {
@@ -1576,15 +1797,7 @@ def run_review(
             }
 
     # ── Specialist review ─────────────────────────────────────────────
-    # Patterns that match actual P1 severity markers in specialist responses.
-    # Excludes the summary line "P1 (blocking): 0" that appears in every response.
-    _p1_patterns = [
-        r"\*\*Severity:\*\*\s*P1",        # **Severity:** P1
-        r"^-\s+\*\*P1\b",                 # - **P1 ...
-        r"Severity.*P1.*blocking",         # Severity: P1 (blocking)
-        r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",  # P1 (blocking) but NOT "P1 (blocking): 0"
-    ]
-
+    # (_p1_patterns is defined above the Cuddy block so both share it.)
     specialist_results: list[dict] = []
 
     # Exclude Cuddy from specialist loop — she already ran as pre-review
@@ -1616,8 +1829,13 @@ def run_review(
         model = resolve_specialist_model(spec, tier, board)
         print(f"\n  [{spec['id'].upper()}] {spec['name']} ({spec['title']}) -- reviewing {len(spec_files)} file(s) with {model}...")
 
+        # Give the reviewer the full post-change file content so claims about
+        # symbols/guards/flow can be verified instead of hallucinated.
+        _full_ctx = _build_full_file_context(spec_files, staged)
+        spec_input = spec_diff + ("\n" + _full_ctx if _full_ctx else "")
+
         try:
-            spec_id, model_used, response = _call_specialist(spec, model, spec_diff, max_tokens)
+            spec_id, model_used, response = _call_specialist(spec, model, spec_input, max_tokens)
             print(f"    -> {len(response)} chars received")
 
             specialist_results.append({
@@ -1628,14 +1846,19 @@ def run_review(
                 "files_reviewed": spec_files,
             })
 
-            # Check for actual P1 findings using patterns defined above the loop
-            _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                          for p in _p1_patterns)
-            if _has_p1:
-                blocking_findings.append(f"{spec['name']}: P1 found")
-                all_pass = False
-            elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                all_pass = False
+            # A "I wasn't given the file" complaint is a routing gap, not a
+            # defect — never let it block the commit.
+            if _is_routing_gap_complaint(response):
+                print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
+            else:
+                # Check for actual P1 findings using patterns defined above the loop
+                _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                              for p in _p1_patterns)
+                if _has_p1:
+                    blocking_findings.append(f"{spec['name']}: P1 found")
+                    all_pass = False
+                elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                    all_pass = False
 
             if spec.get("dynamic"):
                 fid = spec["id"]
@@ -1651,7 +1874,7 @@ def run_review(
             if fallback and fallback != model:
                 print(f"    -> Trying fallback {fallback}...")
                 try:
-                    spec_id, model_used, response = _call_specialist(spec, fallback, spec_diff, max_tokens)
+                    spec_id, model_used, response = _call_specialist(spec, fallback, spec_input, max_tokens)
                     print(f"    -> {len(response)} chars received (via {fallback})")
                     specialist_results.append({
                         "specialist_id": spec_id,
@@ -1661,13 +1884,16 @@ def run_review(
                         "files_reviewed": spec_files,
                     })
                     # Apply same P1/FAIL check as primary path — do NOT skip with continue
-                    _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                                 for p in _p1_patterns)
-                    if _fb_p1:
-                        blocking_findings.append(f"{spec['name']}: P1 found")
-                        all_pass = False
-                    elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                        all_pass = False
+                    if _is_routing_gap_complaint(response):
+                        print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
+                    else:
+                        _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                                     for p in _p1_patterns)
+                        if _fb_p1:
+                            blocking_findings.append(f"{spec['name']}: P1 found")
+                            all_pass = False
+                        elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                            all_pass = False
                     continue
                 except Exception as exc2:
                     print(f"    -> Fallback also failed: {exc2}")
