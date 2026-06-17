@@ -19,6 +19,16 @@ import argparse
 import sys
 import textwrap
 
+# Windows consoles default stdout/stderr to cp1252, which can't encode the
+# unicode this CLI prints (e.g. the "→" in the stamp confirmation) — that raised
+# UnicodeEncodeError and crashed the post-commit stamp step on Windows. Force
+# UTF-8 with replacement so output is identical and crash-free on every platform.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from .gatekeeper import (
     run_review, run_onboarding, run_appeal, run_cleanup,
     run_pre_push_check,
