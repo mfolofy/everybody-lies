@@ -1,0 +1,184 @@
+#!/bin/sh
+# Portable launcher: pick the interpreter that can actually import everybody_lies.
+# (Windows has BOTH a python3 — the Store stub, no package — AND python/Python314
+# with the editable install; WSL has only python3. Naive python3-first picks the
+# dud on Windows, so House degraded to a warning. Test-import, then exec.)
+# The next line is a no-op string-concat in Python, an exec in /bin/sh.
+"exec" "$(for p in python3 python py; do command -v $p >/dev/null 2>&1 && $p -c 'import everybody_lies' 2>/dev/null && { command -v $p; break; }; done || command -v python3 || command -v python)" "$0" "$@"
+"""
+House Pre-Commit Hook
+=====================
+Blocks git commit if House rejects the staged changes.
+
+Install: python scripts/tools/install-house-hook.py
+Bypass:  HOUSE_BYPASS=1 git commit -m "message"  (logged in house-commits.jsonl)
+Tier:    HOUSE_TIER=fast (default) | standard | adversarial
+
+House reviews EVERYTHING. Nobody gets a free pass.
+"""
+
+import json
+import os
+import secrets as _secrets_mod
+import subprocess
+import sys
+from pathlib import Path
+
+# -- Config --
+REPO_ROOT = Path(subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"],
+    capture_output=True, text=True, timeout=5,
+).stdout.strip())
+
+# Resolve the REAL git dir — in a worktree, REPO_ROOT/.git is a FILE (a gitdir
+# pointer), not a directory, so writing tokens under it fails. `git rev-parse
+# --git-dir` yields the correct per-worktree git dir (.git/worktrees/<name>).
+GIT_DIR = Path(subprocess.run(
+    ["git", "rev-parse", "--git-dir"],
+    capture_output=True, text=True, timeout=5,
+).stdout.strip())
+if not GIT_DIR.is_absolute():
+    GIT_DIR = (REPO_ROOT / GIT_DIR).resolve()
+
+# -- Early bypass (must be before module imports that may not exist) --
+_BYPASS = os.environ.get("HOUSE_BYPASS") == "1"
+if _BYPASS:
+    sys.exit(0)
+
+# -- Static sanitize gate: check staged files BEFORE House AI review --
+# Blocks gitignore leaks, dot artifacts, and secret-named files.
+# Deterministic, zero-cost, <50ms.
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "tools"))
+try:
+    from house_sanitize import check_staged_files, print_violations
+    _violations = check_staged_files(REPO_ROOT)
+    if _violations:
+        print_violations(_violations)
+        _p1 = sum(1 for v in _violations if v["severity"] == "P1")
+        if _p1 > 0:
+            sys.exit(1)
+except ImportError:
+    print("[HOUSE] WARNING: house_sanitize.py not found — skipping static gate", file=sys.stderr)
+except Exception as e:
+    print(f"[HOUSE] WARNING: house_sanitize check failed ({e}) — skipping", file=sys.stderr)
+
+from house_common import build_house_env  # noqa: E402
+
+SUBMODULE  = REPO_ROOT / "everybody-lies"
+CHART_PATH = REPO_ROOT / "agents" / "house" / "chart.json"
+HOUSE_HOME = REPO_ROOT / "docs"
+# Only pin a tier when the user explicitly asks via HOUSE_TIER. Otherwise let
+# House choose the tier from the change's risk score (low-risk -> fast), so a
+# tiny one-file utility isn't forced through the exhaustive "standard"
+# differential. (Historical bug: always passing --tier standard meant House's
+# own "recommended: fast" was ignored -> 11 review rounds on a 1.8-risk file.)
+DEFAULT_TIER = os.environ.get("HOUSE_TIER")  # None => risk-driven
+MIN_LINES_FOR_REVIEW = 5
+
+# Per-invocation token prevents race conditions under concurrent commits
+_TOKEN = _secrets_mod.token_hex(4)
+HOUSE_RFC_FILE = GIT_DIR / f"HOUSE_RFC_{_TOKEN}"
+HOUSE_RESULT_JSON = HOUSE_HOME / "reviews" / f".house_last_result_{_TOKEN}.json"
+HOUSE_TOKEN_FILE = GIT_DIR / "HOUSE_TOKEN"
+
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+
+def main() -> int:
+    if os.environ.get("HOUSE_BYPASS"):
+        print(f"{YELLOW}[HOUSE] BYPASSED — commit will be logged in house-commits.jsonl{RESET}")
+        print(f"{YELLOW}[HOUSE] You better have a damn good reason.{RESET}")
+        HOUSE_RFC_FILE.write_text("BYPASSED", encoding="utf-8")
+        HOUSE_TOKEN_FILE.write_text(_TOKEN, encoding="utf-8")
+        return 0
+
+    probe = subprocess.run(
+        [sys.executable, "-c", "import everybody_lies"],
+        capture_output=True, cwd=REPO_ROOT, timeout=30,
+    )
+    if probe.returncode != 0:
+        print(f"{RED}[HOUSE] everybody_lies not importable. Install: pip install -e {SUBMODULE}{RESET}")
+        return 1
+
+    diff_result = subprocess.run(
+        ["git", "diff", "--cached"],
+        capture_output=True, cwd=REPO_ROOT, timeout=10,
+    )
+    diff = diff_result.stdout.decode("utf-8", errors="replace").strip()
+
+    if not diff:
+        print(f"{YELLOW}[HOUSE] No staged changes to review.{RESET}")
+        return 0
+
+    line_count = len([l for l in diff.split("\n") if l.startswith("+") or l.startswith("-")])
+    if line_count < MIN_LINES_FOR_REVIEW:
+        print(f"{YELLOW}[HOUSE] {line_count} lines — skipping review (threshold: {MIN_LINES_FOR_REVIEW}){RESET}")
+        return 0
+
+    files = set()
+    for line in diff.split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                files.add(parts[3][2:])
+
+    print(f"\n{BOLD}{'=' * 70}{RESET}")
+    print(f"{BOLD}  HOUSE PRE-COMMIT GATE — {len(files)} file(s), {line_count} lines{RESET}")
+    print(f"{BOLD}  Tier: {DEFAULT_TIER or 'auto (risk-driven)'}{RESET}")
+    print(f"{BOLD}{'=' * 70}{RESET}\n")
+
+    HOUSE_RESULT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    HOUSE_TOKEN_FILE.write_text(_TOKEN, encoding="utf-8")
+
+    cmd = [
+        sys.executable, "-m", "everybody_lies",
+        "--staged",
+        "--title", f"Pre-commit review: {', '.join(sorted(files)[:3])}",
+        "--type", "standard",
+        "--output", str(HOUSE_RESULT_JSON),
+    ]
+    # Pass --tier only when explicitly pinned; otherwise House picks by risk.
+    if DEFAULT_TIER:
+        cmd[3:3] = ["--tier", DEFAULT_TIER]
+
+    print(f"[HOUSE] Reviewing... (this takes ~10-30 seconds)\n")
+    try:
+        result = subprocess.run(
+            cmd, cwd=REPO_ROOT,
+            env=build_house_env(REPO_ROOT, HOUSE_HOME, CHART_PATH),
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"\n{RED}{BOLD}[HOUSE] REVIEW TIMED OUT — commit blocked.{RESET}", file=sys.stderr)
+        return 1
+
+    if result.returncode == 0:
+        rfc_id = _read_rfc_from_result()
+        HOUSE_RFC_FILE.write_text(rfc_id or "APPROVED", encoding="utf-8")
+        print(f"\n{GREEN}{BOLD}[HOUSE] APPROVED — you may commit.{RESET}")
+        if rfc_id:
+            print(f"{GREEN}[HOUSE] House-RFC: {rfc_id}{RESET}")
+        print(f"{GREEN}[HOUSE] Include in commit message: Reviewed-by: House (Gatekeeper) <noreply@ghost-stack.ai>{RESET}")
+        return 0
+    else:
+        HOUSE_RFC_FILE.unlink(missing_ok=True)
+        HOUSE_TOKEN_FILE.unlink(missing_ok=True)
+        print(f"\n{RED}{BOLD}[HOUSE] REJECTED — commit blocked.{RESET}", file=sys.stderr)
+        print(f"{RED}[HOUSE] Fix the issues above and try again.{RESET}", file=sys.stderr)
+        return 1
+
+
+def _read_rfc_from_result() -> str:
+    try:
+        data = json.loads(HOUSE_RESULT_JSON.read_text(encoding="utf-8"))
+        return data.get("rfc_id", "")
+    except Exception:
+        return ""
+
+
+if __name__ == "__main__":
+    sys.exit(main())
