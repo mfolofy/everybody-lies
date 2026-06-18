@@ -145,6 +145,13 @@ def _parse_house_gate() -> dict:
       subagents_running: bool — true=block commit, false=skip process scan
       locked_decisions: str — injected into Cuddy prompt as ground truth
       tier_floor: fast|standard|adversarial — minimum tier floor
+      plan_authorized: str — skip Cuddy's differential, log plan reference
+          e.g. '{"plan_authorized": "SCOPE.md phase-2 step-3: full site rebuild"}'
+          Use when a commit is executing an approved plan step (full rebuilds,
+          docx generation workflows, etc.). Cuddy is skipped; specialists still run.
+      cuddy_skip: bool — skip Cuddy's differential silently (no plan reference)
+          e.g. '{"cuddy_skip": true}'
+          Use for low-risk cosmetic work where the differential is obviously moot.
     """
     global _HOUSE_GATE_CACHE
     if _HOUSE_GATE_CACHE is not None:
@@ -1769,14 +1776,52 @@ def run_review(
         r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",  # P1 (blocking) but NOT "P1 (blocking): 0"
     ]
 
-    if cuddy_spec and diff_text.strip():
+    # ── HOUSE_GATE: plan_authorized / cuddy_skip escape hatch ────────────
+    # When a commit is part of an approved plan (e.g. full site rebuild, docx
+    # generation workflow) the differential is already settled. Setting either
+    # key in HOUSE_GATE tells Cuddy to skip the approach check and proceed
+    # directly to the specialist code-quality review.
+    #
+    # Usage (set before committing):
+    #   $env:HOUSE_GATE = '{"plan_authorized": "SCOPE.md phase-2 step-3: full index.html rebuild"}'
+    #   $env:HOUSE_GATE = '{"cuddy_skip": true}'
+    #
+    # plan_authorized (string): human-readable plan reference logged to the review.
+    #   Cuddy is skipped with a note citing the plan reference.
+    # cuddy_skip (bool): silent skip — no plan reference required.
+    #   Use only for low-risk cosmetic work where the differential is obviously moot.
+    # (gate was already parsed for tier_floor above — _parse_house_gate() is cached)
+    _plan_auth = gate.get("plan_authorized", "")
+    _cuddy_skip = gate.get("cuddy_skip", False)
+    if _cuddy_skip or _plan_auth:
+        skip_reason = (f"plan_authorized: {_plan_auth}" if _plan_auth else "cuddy_skip=true")
+        print(f"\n  [CUDDY — SKIPPED] Differential bypassed ({skip_reason})")
+        print(f"  Specialists will review code quality only. Approach pre-approved.")
+        cuddy_finding = {
+            "specialist_id": "cuddy",
+            "specialist_name": "Dr. Lisa Cuddy",
+            "model": "skipped",
+            "response": (
+                f"## Differential Diagnosis\n\n"
+                f"**Skipped** — {skip_reason}.\n\n"
+                f"The approach has been pre-authorized via HOUSE_GATE. "
+                f"Cuddy defers to the orchestrator's judgment on approach selection. "
+                f"Specialists will evaluate code quality only.\n\n"
+                f"## Summary\n- Total alternatives considered: 0\n"
+                f"- **Verdict:** PASS (approach pre-authorized)"
+            ),
+            "files_reviewed": files,
+            "pre_review": True,
+            "skipped": True,
+        }
+    elif cuddy_spec and diff_text.strip():
         cuddy_model = resolve_specialist_model(cuddy_spec, tier, board)
         print(f"\n  [CUDDY — DIFFERENTIAL DIAGNOSIS] {cuddy_spec['name']} ({cuddy_spec['title']})")
         print(f"  Ruling out simpler alternatives before the specialists touch this...")
         print(f"  Model: {cuddy_model}")
 
+    if cuddy_spec and diff_text.strip() and not (_cuddy_skip or _plan_auth):
         # ── Inject HOUSE_GATE locked_decisions into Cuddy context ─────────
-        gate = _parse_house_gate()
         locked = gate.get("locked_decisions", "")
         if locked:
             gate_context = f"LOCKED DECISIONS (pre-approved by orchestrator — do not re-litigate):\n{locked}"

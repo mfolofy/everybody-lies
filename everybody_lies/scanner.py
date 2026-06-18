@@ -430,7 +430,15 @@ PATTERNS = [
     (
         "hardcoded-api-endpoint-with-creds",
         "P2",
-        r"https?://[^:]+:[^@]+@[a-zA-Z0-9.-]+",
+        # Matches user:password@host pattern in URLs.
+        # Deliberately excludes:
+        #   - CSS @-rules (e.g., fonts.googleapis.com/css2?family=Inter:wght@400)
+        #     where "password" contains CSS weight suffixes like @400, @700
+        #   - Query-string @-signs (e.g., font_url?family=Name:ital,wght@0,400)
+        # The negative lookahead (?![0-9,;]) ensures the token after the first @
+        # is not a numeric CSS weight or comma-separated axis list — those are not
+        # passwords. Real credential URLs have a host name after the @.
+        r"https?://[^:/?#]+:[^@/?#]{4,}@(?![0-9,;])[a-zA-Z0-9.-]+",
         "URL with embedded credentials — password in URL is a security anti-pattern",
         "Never embed credentials in URLs. Use token auth, headers, or env vars.",
         None,

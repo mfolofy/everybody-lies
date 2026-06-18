@@ -113,3 +113,34 @@ def test_tier_floor_no_downgrade(monkeypatch):
     else:
         pass  # no downgrade — tier stays adversarial
     assert tier == "adversarial"
+
+
+def test_plan_authorized_is_parsed(monkeypatch):
+    """plan_authorized key is accessible from HOUSE_GATE."""
+    reset_gate_cache()
+    ref = "SCOPE.md phase-2 step-3: full index.html rebuild"
+    monkeypatch.setenv("HOUSE_GATE", json.dumps({"plan_authorized": ref}))
+    from everybody_lies.gatekeeper import _parse_house_gate
+    gate = _parse_house_gate()
+    assert gate.get("plan_authorized") == ref
+
+
+def test_cuddy_skip_is_parsed(monkeypatch):
+    """cuddy_skip key is accessible from HOUSE_GATE."""
+    reset_gate_cache()
+    monkeypatch.setenv("HOUSE_GATE", json.dumps({"cuddy_skip": True}))
+    from everybody_lies.gatekeeper import _parse_house_gate
+    gate = _parse_house_gate()
+    assert gate.get("cuddy_skip") is True
+
+
+def test_neither_key_set_means_no_skip(monkeypatch):
+    """When neither plan_authorized nor cuddy_skip is set, both evaluate falsy."""
+    reset_gate_cache()
+    monkeypatch.setenv("HOUSE_GATE", json.dumps({"tier_floor": "standard"}))
+    from everybody_lies.gatekeeper import _parse_house_gate
+    gate = _parse_house_gate()
+    _plan_auth = gate.get("plan_authorized", "")
+    _cuddy_skip = gate.get("cuddy_skip", False)
+    assert not _plan_auth
+    assert not _cuddy_skip
