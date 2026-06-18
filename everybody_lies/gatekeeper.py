@@ -273,15 +273,49 @@ def _find_locked_decisions_from_repo() -> str:
     return "\n\n".join(sections) if sections else ""
 
 
+def _new_branch_base(new_sha: str) -> str | None:
+    """Resolve the review base for a brand-new branch (no remote tip yet).
+
+    A new branch ref pushes with remote_sha == NULL_SHA. Reviewing NULL..new_sha
+    walks the new branch's ENTIRE history and re-flags pre-existing out-of-scope
+    objects already in the default branch (not new work). Instead, base the
+    review on merge-base(default_branch, new_sha) so only commits unique to the
+    new branch are reviewed. Falls back to None (caller reviews only the tip).
+    """
+    for base in ("main", "master"):
+        result = subprocess.run(
+            ["git", "merge-base", base, new_sha],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
 def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
     """Return file paths introduced in old_sha..new_sha via git rev-list --objects.
 
     Uses old_sha (remote tip) as the base so only new objects are listed —
     handles force pushes correctly (does not re-scan historical objects).
-    On new branches (old_sha == NULL_SHA), lists all objects in new_sha.
+    On new branches (old_sha == NULL_SHA), bases the review on the merge-base
+    against the default branch so only commits unique to the branch are
+    reviewed — not the full history. If no merge-base exists, reviews only the
+    single tip commit (new_sha~1..new_sha) rather than the whole history.
     """
     if old_sha == _NULL_SHA or not old_sha:
-        cmd = ["git", "rev-list", "--objects", new_sha]
+        base = _new_branch_base(new_sha)
+        if base:
+            cmd = ["git", "rev-list", "--objects", f"{base}..{new_sha}"]
+        else:
+            # no merge-base: review only the tip commit's objects, not history.
+            # Exclude every parent so we list just this commit's tree; on a root
+            # commit (no parent) there is nothing to exclude and we list its tree.
+            parents = subprocess.run(
+                ["git", "rev-list", "--parents", "-n", "1", new_sha],
+                capture_output=True, text=True, timeout=30)
+            excludes = []
+            if parents.returncode == 0:
+                excludes = [f"^{p}" for p in parents.stdout.split()[1:]]
+            cmd = ["git", "rev-list", "--objects", new_sha, *excludes]
     else:
         cmd = ["git", "rev-list", "--objects", f"{old_sha}..{new_sha}"]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
