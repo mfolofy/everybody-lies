@@ -4,19 +4,23 @@ Regression guard for the night jen_mailbox.py took 11 review rounds:
   - a 1.8-risk one-file utility must run "fast", not be forced to "standard"
   - Cuddy's approach-level FAIL must not hard-block on fast/standard tiers
 """
+import re
+
 from everybody_lies.gatekeeper import (
     _resolve_effective_tier,
     _recommend_tier,
     _cuddy_should_block,
     _is_routing_gap_complaint,
+    P1_PATTERNS,
 )
 
-_P1_PATTERNS = [
-    r"\*\*Severity:\*\*\s*P1",
-    r"^-\s+\*\*P1\b",
-    r"Severity.*P1.*blocking",
-    r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",
-]
+# Use the gate's REAL patterns — no local duplicate that can drift out of sync.
+_P1_PATTERNS = P1_PATTERNS
+
+
+def _text_has_p1(text: str) -> bool:
+    """Mirror the gate's blocking-P1 detection (gatekeeper.py ~L1935)."""
+    return any(re.search(p, text, re.MULTILINE | re.IGNORECASE) for p in P1_PATTERNS)
 
 
 # ── Issue #1: honor the risk-recommended tier ──────────────────────────────
@@ -126,3 +130,43 @@ def test_normal_finding_is_not_routing_gap():
         "on the network call at line 42.\n"
     )
     assert _is_routing_gap_complaint(resp) is False
+
+
+# ── Regression: phantom P1 from a PASS summary line (2026-06-19) ────────────
+# A specialist that PASSES emits "- **P1 (blocking): 0". DeepSeek often bolds
+# the count ("- **P1 (blocking):** 0"), which slipped past the zero-count guard
+# and was read as a real P1 — false-blocking clean commits a different
+# specialist each round. These guard that exact line, in every formatting.
+
+def test_zero_count_summary_does_not_trigger_p1():
+    for line in (
+        "- **P1 (blocking):** 0",      # bold count — the actual bug
+        "- P1 (blocking): 0",          # plain
+        "**P1 (blocking):** 0",        # bold, no bullet
+        "- **P1 (blocking):**  0",     # extra space
+        "- P1 (blocking):0",           # no space
+    ):
+        assert _text_has_p1(line) is False, f"phantom P1 on: {line!r}"
+
+
+def test_zero_count_in_full_pass_summary_does_not_trigger_p1():
+    resp = (
+        "## Findings\nNo findings. The diff is content-only.\n\n"
+        "## Summary\n"
+        "- **Total findings:** 0\n"
+        "- **P1 (blocking):** 0\n"
+        "- **P2 (high):** 0\n"
+        "- **Verdict:** PASS\n"
+    )
+    assert _text_has_p1(resp) is False
+
+
+def test_real_p1_still_detected():
+    for line in (
+        "- **Severity:** P1",
+        "- **P1 — SQL injection in the query builder**",
+        "- **P1: unguarded KeyError on lead['company']**",
+        "Severity: P1 (blocking)",
+        "- **P1 (blocking):** 2",       # a NON-zero count must still block
+    ):
+        assert _text_has_p1(line) is True, f"missed real P1 on: {line!r}"

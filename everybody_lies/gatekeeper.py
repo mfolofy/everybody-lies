@@ -1157,6 +1157,19 @@ def _is_routing_gap_complaint(response: str) -> bool:
     return any(p in head for p in phrases)
 
 
+# Patterns that match an ACTUAL P1 severity marker in a review response.
+# Must NOT match the zero-count summary line every specialist emits, in any
+# Markdown formatting — e.g. "- **P1 (blocking):** 0". A regex blind spot for
+# the bold variant caused phantom P1 blocks (2026-06-19). Module-level so the
+# gate and the test suite share ONE source of truth (no drift).
+P1_PATTERNS = [
+    r"\*\*Severity:\*\*\s*P1",        # **Severity:** P1
+    r"^-\s+\*\*P1(?!\s*\(blocking\))",  # - **P1 (finding) ... but NOT the "- **P1 (blocking): N" summary line
+    r"Severity.*P1.*blocking",         # Severity: P1 (blocking)
+    r"P1\s*[\(\-–]\s*block(?!ing\)[*]{0,2}:?\s*[*]{0,2}\s*0)",  # P1 (blocking) but NOT any zero-count variant incl. bold "**P1 (blocking):** 0"
+]
+
+
 def _cuddy_should_block(cuddy_response: str, tier: str, p1_patterns: list[str]) -> bool:
     """Decide whether Cuddy's differential should HARD-BLOCK the commit.
 
@@ -1769,12 +1782,7 @@ def run_review(
     # previously this was an empty list here and only populated after the Cuddy
     # block, so Cuddy's P1 check was dead code and any "FAIL" (even an advisory
     # P2 "simpler alternative") hard-blocked the commit on every tier.
-    _p1_patterns = [
-        r"\*\*Severity:\*\*\s*P1",        # **Severity:** P1
-        r"^-\s+\*\*P1\b",                 # - **P1 ...
-        r"Severity.*P1.*blocking",         # Severity: P1 (blocking)
-        r"P1\s*[\(\-–]\s*block(?!ing\):\s*0)",  # P1 (blocking) but NOT "P1 (blocking): 0"
-    ]
+    _p1_patterns = P1_PATTERNS  # module-level single source of truth (see def above _cuddy_should_block)
 
     # ── HOUSE_GATE: plan_authorized / cuddy_skip escape hatch ────────────
     # When a commit is part of an approved plan (e.g. full site rebuild, docx
