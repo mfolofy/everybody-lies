@@ -168,7 +168,8 @@ def call_llm(
     user_prompt: str,
     api_key: str = "",
     max_tokens: int = 4096,
-    temperature: float = 0.3,
+    temperature: float = 0.0,
+    seed: int = 42,
 ) -> str:
     """Call an LLM via the best available provider.
 
@@ -238,6 +239,10 @@ def call_llm(
                 ],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                # Fixed seed + temperature 0 → reproducible reviews: the same diff
+                # yields the same findings/verdict across runs (OpenAI-compatible
+                # providers incl. DeepSeek honor `seed`). Was the #1 nondeterminism source.
+                "seed": seed,
             }
 
         try:

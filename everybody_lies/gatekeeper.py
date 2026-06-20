@@ -853,7 +853,7 @@ def _call_specialist(spec: dict, model: str, diff_text: str,
         If you were not given a file you need, say so as P4 (informational) —
         a missing file is a routing gap, NOT a code defect, and must not block.""")
 
-    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.4)
+    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.0)
     return spec["id"], model, response
 
 
@@ -907,7 +907,7 @@ def _call_cuddy(cuddy_spec: dict, model: str, diff_text: str,
         Cite exact file paths and line numbers for the code under scrutiny.
         This is a differential diagnosis — rule out everything simpler FIRST.""")
 
-    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.4)
+    response = call_llm(model, system, diff_text, max_tokens=max_tokens, temperature=0.0)
     return cuddy_spec["id"], model, response
 
 
@@ -1016,7 +1016,7 @@ def _call_house_synthesis(house_config: dict, specialist_findings: list[dict],
         findings_text += f"\n---\n\n{suppression_suggestions}\n\n---\n\n"
 
     user = f"Change: {change_title}\n\nReview findings:\n{findings_text}"
-    return call_llm(model, system, user, max_tokens=max_tokens, temperature=0.5)
+    return call_llm(model, system, user, max_tokens=max_tokens, temperature=0.0)
 
 
 def _calculate_risk_score(files: list[str], diff_text: str) -> float:
@@ -1925,6 +1925,13 @@ def run_review(
             spec_id, model_used, response = _call_specialist(spec, model, spec_input, max_tokens)
             print(f"    -> {len(response)} chars received")
 
+            # An empty/near-empty response is NOT a clean pass — the model returned
+            # nothing (transient API hiccup, truncation). Previously this was scraped
+            # for findings, found none, and silently PASSED — a per-run nondeterminism
+            # source. Route it through the same retry/UNAVAILABLE path as a hard failure.
+            if len(response.strip()) < 20:
+                raise RuntimeError(f"empty or too-short review ({len(response.strip())} chars)")
+
             specialist_results.append({
                 "specialist_id": spec_id,
                 "specialist_name": spec["name"],
@@ -1963,6 +1970,8 @@ def run_review(
                 try:
                     spec_id, model_used, response = _call_specialist(spec, fallback, spec_input, max_tokens)
                     print(f"    -> {len(response)} chars received (via {fallback})")
+                    if len(response.strip()) < 20:
+                        raise RuntimeError(f"empty or too-short fallback review ({len(response.strip())} chars)")
                     specialist_results.append({
                         "specialist_id": spec_id,
                         "specialist_name": spec["name"],
@@ -2490,7 +2499,7 @@ def run_appeal(rfc_id: str = "", justification: str = "",
 
     print(f"  [WILSON] Evaluating appeal...")
     try:
-        response = call_llm(model, system, user, max_tokens=4096, temperature=0.4)
+        response = call_llm(model, system, user, max_tokens=4096, temperature=0.0)
         print(f"    -> {len(response)} chars received")
     except Exception as exc:
         print(f"    -> Wilson unavailable: {exc}")
