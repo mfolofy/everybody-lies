@@ -43,9 +43,11 @@
     "responsibility": "Synthesizes specialist findings, issues final verdict. Does NOT review code directly — delegates to fellows, aggregates, decides.",
     "review_prompt": "You are Dr. Gregory House, the code review gatekeeper. Your fellows have submitted their findings. Synthesize them into a single verdict. Identify conflicts between reviewers. If any P1 or P2 findings exist, REJECT. If only P3/P4, you may APPROVE with recommendations. Be brutal. Be specific. Cite exact file paths and line numbers. Your signature is required before any commit.",
     "verdict_rules": {
-      "any_p1": "AUTOMATIC REJECTION — no override possible. Not even Wilson can overturn.",
-      "any_p2": "REJECTED — Orchestrator may appeal to Wilson with written justification",
-      "p3_p4_only": "APPROVED with recommendations — fixes can be deferred",
+      "_how_the_gate_actually_works": "The MECHANICAL gate (gatekeeper.py) blocks on: (1) P1 regex match in ANY specialist response, OR (2) FAIL substring in the specialist response body, OR (3) House synthesis text starts with REJECTED. P2 findings cause FAIL in the specialist response, which triggers the FAIL-substring block. Both paths route through the same rejection outcome. The distinction below is operational: P1 = no appeal; P2 = appeal available. The code does NOT do a bare P2 regex scan — P2 rejection flows through the specialist structured verdict block (REJECT) or FAIL prose.",
+      "any_p1": "AUTOMATIC REJECTION — P1 regex detected in specialist response OR P1 in deterministic scan. Not appealable. Not even Wilson can overturn.",
+      "any_p2": "REJECTED — P2 causes specialist to emit structured REJECT verdict or FAIL prose, which the gate catches. Orchestrator may appeal to Wilson with written justification.",
+      "fail_without_p1_p2": "REJECTED — specialist emitted FAIL or REJECT with no explicit severity marker. Treated as at-least-P2. May be appealed.",
+      "p3_p4_only": "APPROVED with recommendations — specialists PASS/APPROVE, House synthesis says APPROVED. Fixes can be deferred.",
       "all_clean": "APPROVED — commit and deploy"
     }
   },
@@ -355,21 +357,60 @@
   },
   "tier_floors": {
     "file_patterns": [
-      {"pattern": "**/migrations/**",    "min_tier": "standard"},
-      {"pattern": "**/migrate*.py",      "min_tier": "standard"},
-      {"pattern": "**/db/schema*",       "min_tier": "standard"},
-      {"pattern": "**/db/migrate*",      "min_tier": "standard"},
-      {"pattern": "**/auth/**",          "min_tier": "standard"},
-      {"pattern": "**/financial/**",  "min_tier": "adversarial"},
-      {"pattern": "**/proprietary-*/**", "min_tier": "adversarial"},
-      {"pattern": "**/.env*",            "min_tier": "adversarial"},
-      {"pattern": "**/secrets/**",       "min_tier": "adversarial"},
-      {"pattern": "**/*.pem",            "min_tier": "adversarial"},
-      {"pattern": "**/*.key",            "min_tier": "adversarial"}
+      {
+        "pattern": "**/migrations/**",
+        "min_tier": "standard"
+      },
+      {
+        "pattern": "**/migrate*.py",
+        "min_tier": "standard"
+      },
+      {
+        "pattern": "**/db/schema*",
+        "min_tier": "standard"
+      },
+      {
+        "pattern": "**/db/migrate*",
+        "min_tier": "standard"
+      },
+      {
+        "pattern": "**/auth/**",
+        "min_tier": "standard"
+      },
+      {
+        "pattern": "**/financial/**",
+        "min_tier": "adversarial"
+      },
+      {
+        "pattern": "**/proprietary-*/**",
+        "min_tier": "adversarial"
+      },
+      {
+        "pattern": "**/.env*",
+        "min_tier": "adversarial"
+      },
+      {
+        "pattern": "**/secrets/**",
+        "min_tier": "adversarial"
+      },
+      {
+        "pattern": "**/*.pem",
+        "min_tier": "adversarial"
+      },
+      {
+        "pattern": "**/*.key",
+        "min_tier": "adversarial"
+      }
     ],
     "risk_score_floors": [
-      {"min_score": 4.0, "min_tier": "adversarial"},
-      {"min_score": 2.5, "min_tier": "standard"}
+      {
+        "min_score": 4.0,
+        "min_tier": "adversarial"
+      },
+      {
+        "min_score": 2.5,
+        "min_tier": "standard"
+      }
     ]
   }
 }

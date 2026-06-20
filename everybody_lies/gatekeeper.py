@@ -815,6 +815,62 @@ def _build_full_file_context(files: list[str], staged: bool) -> str:
     return header + "\n\n".join(blocks)
 
 
+def _parse_structured_verdict(response: str) -> dict | None:
+    """Parse the machine-readable verdict block emitted by each specialist.
+
+    Looks for a fenced code block tagged ``verdict`` anywhere in the response:
+
+        ```verdict
+        {"verdict": "APPROVE", "max_severity": "P3", "blocking_findings": []}
+        ```
+
+    Returns a dict with keys:
+        verdict          — "APPROVE" | "REJECT"
+        max_severity     — "P1" | "P2" | "P3" | "P4" | "NONE"
+        blocking_findings — list[str] (may be empty)
+
+    Returns None if no structured block is present (caller falls back to regex).
+    On malformed JSON or missing required keys: returns a CONSERVATIVE default
+    {"verdict": "REJECT", "max_severity": "UNKNOWN", "blocking_findings": []}
+    so a parse failure never silently approves.
+    """
+    _VERDICT_FENCE = re.compile(
+        r"```verdict\s*\n(.*?)\n```",
+        re.DOTALL | re.IGNORECASE,
+    )
+    match = _VERDICT_FENCE.search(response)
+    if not match:
+        return None
+
+    raw = match.group(1).strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Block present but malformed — treat as REJECT (conservative)
+        return {"verdict": "REJECT", "max_severity": "UNKNOWN",
+                "blocking_findings": [], "_parse_error": raw[:200]}
+
+    # Normalise and validate required keys
+    verdict_val = str(parsed.get("verdict", "")).upper()
+    if verdict_val not in ("APPROVE", "REJECT"):
+        # Unrecognised verdict — default to REJECT (safe)
+        verdict_val = "REJECT"
+
+    severity = str(parsed.get("max_severity", "NONE")).upper()
+    if severity not in ("P1", "P2", "P3", "P4", "NONE"):
+        severity = "NONE"
+
+    findings = parsed.get("blocking_findings", [])
+    if not isinstance(findings, list):
+        findings = []
+
+    return {
+        "verdict": verdict_val,
+        "max_severity": severity,
+        "blocking_findings": [str(f) for f in findings],
+    }
+
+
 def _call_specialist(spec: dict, model: str, diff_text: str,
                      max_tokens: int) -> tuple[str, str, str]:
     """Call a single specialist. Returns (specialist_id, model_used, response_text)."""
@@ -840,6 +896,21 @@ def _call_specialist(spec: dict, model: str, diff_text: str,
         - P3 (medium): N
         - P4 (low): N
         - **Verdict:** PASS or FAIL
+
+        ## Machine-Readable Verdict (REQUIRED — emit this EXACTLY at the end)
+        After your summary, output a fenced code block tagged `verdict` containing
+        a JSON object. This is parsed by the gate — do NOT skip it or alter the format.
+
+        ```verdict
+        {{"verdict": "APPROVE or REJECT", "max_severity": "P1/P2/P3/P4/NONE", "blocking_findings": ["short description of each P1/P2 issue, or empty list"]}}
+        ```
+
+        Rules for the verdict block:
+        - verdict = REJECT if you have ANY P1 or P2 finding. verdict = APPROVE otherwise.
+        - max_severity = highest severity among your findings (P1, P2, P3, P4, or NONE if clean).
+        - blocking_findings = list of short strings, one per P1/P2 finding. Empty list if none.
+        - Do NOT include any other keys. Keep each blocking_finding under 120 characters.
+        - If you PASS and have no findings: {{"verdict": "APPROVE", "max_severity": "NONE", "blocking_findings": []}}
 
         Be specific. Cite exact file paths and line numbers. No hand-waving.
         If the code is clean, say so and PASS. Do not invent problems.
@@ -1945,14 +2016,36 @@ def run_review(
             if _is_routing_gap_complaint(response):
                 print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
             else:
-                # Check for actual P1 findings using patterns defined above the loop
-                _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                              for p in _p1_patterns)
-                if _has_p1:
-                    blocking_findings.append(f"{spec['name']}: P1 found")
-                    all_pass = False
-                elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                    all_pass = False
+                # ── Deterministic structured-verdict parser (primary path) ──────
+                # Each specialist is asked to emit a ```verdict JSON block.
+                # Parse it first; fall back to legacy regex scrape only if absent.
+                _sv = _parse_structured_verdict(response)
+                if _sv is not None:
+                    # Structured block found — use it deterministically
+                    _sv_verdict = _sv.get("verdict", "REJECT")
+                    _sv_severity = _sv.get("max_severity", "NONE")
+                    if _sv_verdict == "REJECT":
+                        if _sv_severity == "P1":
+                            blocking_findings.append(
+                                f"{spec['name']}: P1 found — "
+                                + (", ".join(_sv["blocking_findings"][:2]) or "see review")
+                            )
+                            all_pass = False
+                        else:
+                            # P2/unknown severity REJECT
+                            all_pass = False
+                    # APPROVE — nothing to do
+                else:
+                    # ── Fallback: legacy regex + FAIL-substring scrape ────────
+                    # Handles old/odd LLM outputs that don't emit the verdict block.
+                    # Default to the SAFER verdict on ambiguity (treated as REJECT).
+                    _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                                  for p in _p1_patterns)
+                    if _has_p1:
+                        blocking_findings.append(f"{spec['name']}: P1 found (fallback regex)")
+                        all_pass = False
+                    elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                        all_pass = False
 
             if spec.get("dynamic"):
                 fid = spec["id"]
@@ -1983,13 +2076,25 @@ def run_review(
                     if _is_routing_gap_complaint(response):
                         print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
                     else:
-                        _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                                     for p in _p1_patterns)
-                        if _fb_p1:
-                            blocking_findings.append(f"{spec['name']}: P1 found")
-                            all_pass = False
-                        elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                            all_pass = False
+                        _fb_sv = _parse_structured_verdict(response)
+                        if _fb_sv is not None:
+                            if _fb_sv.get("verdict") == "REJECT":
+                                if _fb_sv.get("max_severity") == "P1":
+                                    blocking_findings.append(
+                                        f"{spec['name']}: P1 found — "
+                                        + (", ".join(_fb_sv["blocking_findings"][:2]) or "see review")
+                                    )
+                                    all_pass = False
+                                else:
+                                    all_pass = False
+                        else:
+                            _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
+                                         for p in _p1_patterns)
+                            if _fb_p1:
+                                blocking_findings.append(f"{spec['name']}: P1 found (fallback regex)")
+                                all_pass = False
+                            elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+                                all_pass = False
                     continue
                 except Exception as exc2:
                     print(f"    -> Fallback also failed: {exc2}")
