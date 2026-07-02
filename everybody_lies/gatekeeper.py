@@ -1241,6 +1241,51 @@ P1_PATTERNS = [
 ]
 
 
+def _assess_specialist_response(spec_name: str, response: str) -> dict:
+    """Classify one specialist response into a gate decision.
+
+    Returns a dict:
+        blocks   — this response rejects the change
+        hard_p1  — a REAL P1 from a structured LLM verdict (non-appealable)
+        finding  — human-readable blocker string for the console, or None
+
+    Degradation policy (rebuild 2026-07-01):
+    - The primary contract is the structured ```verdict JSON block. A P1
+      declared there is an actual LLM review verdict — it blocks and is
+      NOT appealable. The real review keeps its teeth.
+    - When the block is ABSENT (truncated response, degraded fallback model
+      after a provider outage, odd output), the legacy P1_PATTERNS regex
+      scrape over free text is a HEURISTIC, not a review verdict. It still
+      blocks (skepticism stays), but it is labeled as heuristic and remains
+      APPEALABLE — a reviewer that could not complete a structured review
+      must never fabricate a non-appealable blocker. This is the exact bug
+      that let an Anthropic 529 outage hard-block legitimate
+      subprocess-spawning mesh tooling with "P1 found (fallback regex)".
+    """
+    _sv = _parse_structured_verdict(response)
+    if _sv is not None:
+        if _sv.get("verdict") == "REJECT":
+            if _sv.get("max_severity") == "P1":
+                return {
+                    "blocks": True, "hard_p1": True,
+                    "finding": f"{spec_name}: P1 found — "
+                               + (", ".join(_sv["blocking_findings"][:2]) or "see review"),
+                }
+            return {"blocks": True, "hard_p1": False, "finding": None}  # P2/unknown REJECT
+        return {"blocks": False, "hard_p1": False, "finding": None}     # APPROVE
+
+    # No structured block — heuristic scrape of unstructured text.
+    if any(re.search(p, response, re.MULTILINE | re.IGNORECASE) for p in P1_PATTERNS):
+        return {
+            "blocks": True, "hard_p1": False,
+            "finding": (f"{spec_name}: possible P1 [HEURISTIC — regex scrape of an "
+                        f"unstructured/degraded response; appealable, not a verified verdict]"),
+        }
+    if "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+        return {"blocks": True, "hard_p1": False, "finding": None}
+    return {"blocks": False, "hard_p1": False, "finding": None}
+
+
 def _cuddy_should_block(cuddy_response: str, tier: str, p1_patterns: list[str]) -> bool:
     """Decide whether Cuddy's differential should HARD-BLOCK the commit.
 
@@ -1706,6 +1751,9 @@ def run_review(
     # Initialize tracking vars (used by scan, Cuddy, specialists)
     all_pass = True
     blocking_findings: list[str] = []
+    # Non-appealable P1s ONLY: structured LLM verdict blocks and deterministic
+    # scan facts. Heuristic scrapes never land here (see _assess_specialist_response).
+    hard_p1_findings: list[str] = []
 
     # Show auto-detected configuration
     if not dry_run:
@@ -1803,7 +1851,9 @@ def run_review(
             return review_data
         else:
             print(f"  [SCAN] Trivial diff but has P1 scan findings — proceeding to AI review.")
-            blocking_findings.append(f"Scanner: {scan_result.p1_count} P1 finding(s) in deterministic scan")
+            _scan_blocker = f"Scanner: {scan_result.p1_count} P1 finding(s) in deterministic scan"
+            blocking_findings.append(_scan_blocker)
+            hard_p1_findings.append(_scan_blocker)  # scan P1s are facts (secrets/PII) — non-appealable
 
     # ── Dry run ───────────────────────────────────────────────────────
     if dry_run:
@@ -2016,36 +2066,16 @@ def run_review(
             if _is_routing_gap_complaint(response):
                 print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
             else:
-                # ── Deterministic structured-verdict parser (primary path) ──────
-                # Each specialist is asked to emit a ```verdict JSON block.
-                # Parse it first; fall back to legacy regex scrape only if absent.
-                _sv = _parse_structured_verdict(response)
-                if _sv is not None:
-                    # Structured block found — use it deterministically
-                    _sv_verdict = _sv.get("verdict", "REJECT")
-                    _sv_severity = _sv.get("max_severity", "NONE")
-                    if _sv_verdict == "REJECT":
-                        if _sv_severity == "P1":
-                            blocking_findings.append(
-                                f"{spec['name']}: P1 found — "
-                                + (", ".join(_sv["blocking_findings"][:2]) or "see review")
-                            )
-                            all_pass = False
-                        else:
-                            # P2/unknown severity REJECT
-                            all_pass = False
-                    # APPROVE — nothing to do
-                else:
-                    # ── Fallback: legacy regex + FAIL-substring scrape ────────
-                    # Handles old/odd LLM outputs that don't emit the verdict block.
-                    # Default to the SAFER verdict on ambiguity (treated as REJECT).
-                    _has_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                                  for p in _p1_patterns)
-                    if _has_p1:
-                        blocking_findings.append(f"{spec['name']}: P1 found (fallback regex)")
-                        all_pass = False
-                    elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                        all_pass = False
+                # Structured ```verdict block is the contract; a missing block
+                # degrades to an APPEALABLE heuristic scrape — never a
+                # fabricated non-appealable P1. See _assess_specialist_response.
+                _assess = _assess_specialist_response(spec["name"], response)
+                if _assess["blocks"]:
+                    all_pass = False
+                if _assess["finding"]:
+                    blocking_findings.append(_assess["finding"])
+                    if _assess["hard_p1"]:
+                        hard_p1_findings.append(_assess["finding"])
 
             if spec.get("dynamic"):
                 fid = spec["id"]
@@ -2057,8 +2087,12 @@ def run_review(
 
         except Exception as exc:
             print(f"    -> FAILED: {exc}")
-            fallback = "deepseek-v4-flash"
-            if fallback and fallback != model:
+            # Fail over ACROSS providers (call_llm already retried transient
+            # errors within each provider). Try up to two alternate models
+            # built from whichever API keys are actually configured.
+            from .providers import available_fallback_models
+            recovered = False
+            for fallback in available_fallback_models(exclude=model)[:2]:
                 print(f"    -> Trying fallback {fallback}...")
                 try:
                     spec_id, model_used, response = _call_specialist(spec, fallback, spec_input, max_tokens)
@@ -2072,32 +2106,24 @@ def run_review(
                         "response": response,
                         "files_reviewed": spec_files,
                     })
-                    # Apply same P1/FAIL check as primary path — do NOT skip with continue
+                    # Same assessment as the primary path: structured verdicts
+                    # keep teeth; scrape-derived P1s stay appealable heuristics.
                     if _is_routing_gap_complaint(response):
                         print(f"    -> {spec['name']} reported a routing gap (no content) — not blocking")
                     else:
-                        _fb_sv = _parse_structured_verdict(response)
-                        if _fb_sv is not None:
-                            if _fb_sv.get("verdict") == "REJECT":
-                                if _fb_sv.get("max_severity") == "P1":
-                                    blocking_findings.append(
-                                        f"{spec['name']}: P1 found — "
-                                        + (", ".join(_fb_sv["blocking_findings"][:2]) or "see review")
-                                    )
-                                    all_pass = False
-                                else:
-                                    all_pass = False
-                        else:
-                            _fb_p1 = any(re.search(p, response, re.MULTILINE | re.IGNORECASE)
-                                         for p in _p1_patterns)
-                            if _fb_p1:
-                                blocking_findings.append(f"{spec['name']}: P1 found (fallback regex)")
-                                all_pass = False
-                            elif "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
-                                all_pass = False
-                    continue
+                        _assess = _assess_specialist_response(spec["name"], response)
+                        if _assess["blocks"]:
+                            all_pass = False
+                        if _assess["finding"]:
+                            blocking_findings.append(_assess["finding"])
+                            if _assess["hard_p1"]:
+                                hard_p1_findings.append(_assess["finding"])
+                    recovered = True
+                    break
                 except Exception as exc2:
-                    print(f"    -> Fallback also failed: {exc2}")
+                    print(f"    -> Fallback {fallback} also failed: {exc2}")
+            if recovered:
+                continue
 
             specialist_results.append({
                 "specialist_id": spec["id"],
@@ -2165,10 +2191,17 @@ def run_review(
         synthesis = f"**ERROR:** House synthesis unavailable. {exc}\n\nManual verdict required from Orchestrator."
 
     # ── Determine verdict ─────────────────────────────────────────────
+    degraded_reason = ""
     valid_responses = [r for r in specialist_results
                        if r.get("model") not in ("n/a", "FAILED", "UNAVAILABLE")]
     if not valid_responses:
-        verdict = "REJECTED"
+        # ALL specialists unreachable after retry + cross-provider failover.
+        # That is a PROVIDER OUTAGE, not a code problem — same class as the
+        # wrapper's fail-open plumbing errors. A reviewer that cannot review
+        # must degrade honestly, not block. Deterministic gates already ran:
+        # house_sanitize (secrets/gitignore, in the hook) and the pre-scan
+        # above. If those FACTS are clean, approve DEGRADED and say so loudly;
+        # if the scan found a P1 fact (secret/PII), still reject.
         failures = []
         for r in specialist_results:
             resp = r.get("response", "")
@@ -2176,11 +2209,30 @@ def run_review(
                 failures.append(f"- {r['specialist_name']}: {resp[:200]}")
         fail_detail = "\n".join(failures) if failures else "Unknown — all specialists failed to respond."
         provider_names = ', '.join(PROVIDERS[p]['env_key'] for p in PROVIDERS)
-        synthesis = (f"**REJECTED:** All {len(specialist_results)} specialists failed. "
-                     f"House cannot review this change.\n\n"
-                     f"Failures:\n{fail_detail}\n\n"
-                     f"Check API keys ({provider_names}), "
-                     f"network connectivity, and model availability, then resubmit.")
+        if scan_result.p1_count > 0 or blocking_findings:
+            verdict = "REJECTED"
+            if scan_result.p1_count > 0:
+                _scan_fact = f"Scanner: {scan_result.p1_count} P1 fact(s) (secrets/PII) in deterministic scan"
+                blocking_findings.append(_scan_fact)
+                hard_p1_findings.append(_scan_fact)
+            synthesis = (f"**REJECTED (DEGRADED):** All LLM providers are unreachable AND "
+                         f"blocking findings exist from the gates that DID run "
+                         f"(deterministic scan P1s: {scan_result.p1_count}; "
+                         f"blockers: {blocking_findings or 'none'}). "
+                         f"Fix those findings, then resubmit.\n\n"
+                         f"Provider failures:\n{fail_detail}")
+        else:
+            verdict = "APPROVED"
+            degraded_reason = "llm_unavailable"
+            synthesis = (f"**APPROVED (DEGRADED — NO LLM REVIEW):** All {len(specialist_results)} "
+                         f"specialists were unreachable (provider outage). The deterministic "
+                         f"gates ran and are clean: house_sanitize secret/gitignore gate (hook) "
+                         f"and the pre-scan ({scan_result.total} findings, 0 P1). Per policy, an "
+                         f"external API outage must not fabricate blockers or brick the workflow "
+                         f"— this commit passed FACTS-ONLY review, not an LLM review.\n\n"
+                         f"Provider failures:\n{fail_detail}\n\n"
+                         f"RECOMMENDED: re-run `everybody-lies --staged` on this change once "
+                         f"providers recover ({provider_names}).")
     elif all_pass and "APPROVED" in synthesis.upper()[:200]:
         verdict = "APPROVED"
     elif "REJECTED" in synthesis.upper()[:200]:
@@ -2219,7 +2271,14 @@ def run_review(
             for r in specialist_results
         ],
         "verdict": verdict,
-        "signed_by": "House (Gatekeeper)",
+        # Structured appealability record (rebuild 2026-07-01): hard_p1 is True
+        # ONLY for P1s from structured LLM verdicts or deterministic scan facts.
+        # run_appeal trusts this over regex-scraping the markdown report.
+        "blocking_findings": blocking_findings,
+        "hard_p1": bool(hard_p1_findings),
+        "degraded": degraded_reason or None,
+        "signed_by": ("House (Gatekeeper) — DEGRADED: deterministic gates only, LLM unavailable"
+                      if degraded_reason else "House (Gatekeeper)"),
     }
 
     # ── Write reports ─────────────────────────────────────────────────
@@ -2286,8 +2345,13 @@ def run_review(
     # ── VERDICT ───────────────────────────────────────────────────────
     print(f"\n{'=' * 70}")
     if verdict == "APPROVED":
-        print(f"  [APPROVED] VERDICT: APPROVED")
-        print(f"  Signed: House (Gatekeeper)")
+        if degraded_reason:
+            print(f"  [APPROVED — DEGRADED] VERDICT: APPROVED (deterministic gates only)")
+            print(f"  !! ALL LLM providers were unreachable — this change got NO AI review.")
+            print(f"  !! Secrets/gitignore/scan gates ran clean. Re-run House when providers recover.")
+        else:
+            print(f"  [APPROVED] VERDICT: APPROVED")
+        print(f"  Signed: {review_data['signed_by']}")
         rfc_id = review_data.get('rfc_id', 'RFC-unknown')
         print(f"  House-RFC: {rfc_id}")
         print(f"  Include in commit message:")
@@ -2300,11 +2364,13 @@ def run_review(
         if blocking_findings:
             for bf in blocking_findings:
                 print(f"  BLOCKER: {bf}")
-        has_p1 = any("P1" in bf for bf in blocking_findings)
-        if has_p1:
+        # Non-appealable ONLY for hard P1s (structured LLM verdict / scan facts).
+        # Heuristic scrape findings are blocking but appealable — a degraded
+        # reviewer must not fabricate non-appealable verdicts.
+        if hard_p1_findings:
             print(f"  P1 findings — not appealable. Fix them. Not even Wilson can help you.")
         else:
-            print(f"  No P1 findings — may appeal to Wilson: everybody-lies --appeal \"justification\" --rfc {review_data.get('rfc_id', 'RFC-unknown')}")
+            print(f"  No hard P1 findings — may appeal to Wilson: everybody-lies --appeal \"justification\" --rfc {review_data.get('rfc_id', 'RFC-unknown')}")
         # ── Loop alert with Diagnostics tiebreak hint ─────────────────
         if total_rounds >= 3:
             print(f"\n  [DIAGNOSTICS] Loop detected ({total_rounds} rounds). Cuddy tiebreak available.")
@@ -2483,15 +2549,24 @@ def run_appeal(rfc_id: str = "", justification: str = "",
         sys.exit(1)
 
     # ── Check for P1 findings (automatic denial) ──────────────────────
-    review_md = _load_full_review_markdown(rfc_id)
-
-    # Scan for P1 findings in the markdown report
-    p1_pattern = re.compile(r'^\s*[-|]\s*(?:\[)?P1(?:\])?\s*[|:]', re.IGNORECASE | re.MULTILINE)
-    has_p1_in_md = bool(p1_pattern.search(review_md))
-
-    # Also check the deterministic scan
+    # Prefer the STRUCTURED hard_p1 record (written by run_review since the
+    # 2026-07-01 rebuild): True only for P1s from structured LLM verdicts or
+    # deterministic scan facts. Regex-scraping the markdown re-fabricates
+    # non-appealable P1s from truncated/degraded responses — the exact bug
+    # this rebuild removes — so it is only used for OLD records that predate
+    # the hard_p1 field.
     scan = review_data.get("deterministic_scan", {})
-    has_p1_scan = scan.get("p1_count", 0) > 0
+    # to_dict() stores counts under summary.P1; the old flat "p1_count" key
+    # never existed in the record (latent bug — check was always False).
+    has_p1_scan = (scan.get("summary", {}).get("P1", 0) or scan.get("p1_count", 0)) > 0
+
+    review_md = _load_full_review_markdown(rfc_id)  # also fed to Wilson below
+    if "hard_p1" in review_data:
+        has_p1_in_md = bool(review_data.get("hard_p1"))
+    else:
+        # Legacy record — fall back to scraping the markdown report.
+        p1_pattern = re.compile(r'^\s*[-|]\s*(?:\[)?P1(?:\])?\s*[|:]', re.IGNORECASE | re.MULTILINE)
+        has_p1_in_md = bool(p1_pattern.search(review_md))
 
     if has_p1_in_md or has_p1_scan:
         print(f"\n{'=' * 70}")

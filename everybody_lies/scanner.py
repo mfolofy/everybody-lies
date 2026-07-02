@@ -88,6 +88,17 @@ class ScanResult:
 # Each pattern: (rule_name, severity, regex, message_template, fix_template, file_filter)
 # file_filter: glob pattern or None for all files
 
+# SEVERITY HONESTY (rebuild 2026-07-01):
+# P1 is reserved for findings that are FACTS — a secret, token, private key, or
+# PII literal in the diff is a leak regardless of context, and P1s are
+# non-appealable hard blocks. Code-SMELL heuristics (shell=True, subprocess with
+# an f-string, eval(), pickle.loads(), DEBUG=True...) are GUESSES about context
+# the regex cannot see — legitimate tooling code (process spawners, mesh
+# launchers, build scripts) matches them constantly. Those are P2: surfaced to
+# the review board and the human, appealable, never a silent non-appealable
+# block. A regex that cannot see context must not fabricate non-appealable
+# blockers ("everybody lies" applies to the scanner too).
+
 PATTERNS = [
     # ═══ P1 — BLOCKING ═══
     (
@@ -115,9 +126,10 @@ PATTERNS = [
         "Never commit private keys. Use a secrets manager or hardware security module.",
         None,
     ),
+    # ── Code-smell heuristics (context-blind — P2, appealable, never P1) ──
     (
         "sql-string-concatenation",
-        "P1",
+        "P2",
         r"(?i)(?:execute|executemany)\s*\(\s*(?:f['\"]|['\"].*\%|['\"].*\.format|['\"].*\+)",
         "Potential SQL injection: string concatenation/interpolation in SQL execute() call",
         "Use parameterized queries: cursor.execute('SELECT ... WHERE id = ?', (value,))",
@@ -125,7 +137,7 @@ PATTERNS = [
     ),
     (
         "os-command-injection",
-        "P1",
+        "P2",
         r"(?i)(?:os\.system|os\.popen|subprocess\.(?:call|run|Popen))\s*\(\s*(?:f['\"]|['\"].*\+|['\"].*\%|['\"].*\.format)",
         "Potential command injection: user input in shell command",
         "Use subprocess.run() with args list (not string) and avoid shell=True with user input.",
@@ -133,7 +145,7 @@ PATTERNS = [
     ),
     (
         "pickle-deserialization",
-        "P1",
+        "P2",
         r"(?i)pickle\.(?:loads?|Unpickler)\s*\(",
         "Insecure deserialization: pickle.loads() on potentially untrusted data",
         "Never unpickle untrusted data. Use JSON or a safe serialization format.",
@@ -141,7 +153,7 @@ PATTERNS = [
     ),
     (
         "debug-true-production",
-        "P1",
+        "P2",
         r"(?i)DEBUG\s*=\s*True|ENV(?:IRONMENT)?\s*=\s*['\"]development['\"]",
         "Debug mode or development environment enabled — potential production config leak",
         "Set DEBUG=False in production. Use environment-specific config files.",
@@ -149,7 +161,7 @@ PATTERNS = [
     ),
     (
         "eval-exec-user-input",
-        "P1",
+        "P2",
         r"(?i)(?:eval|exec|compile)\s*\(\s*(?!['\"]\s*['\"])",
         "Potential code injection: eval()/exec()/compile() with non-literal input",
         "Never use eval()/exec() on untrusted input. There is always a safer alternative.",
@@ -157,7 +169,7 @@ PATTERNS = [
     ),
     (
         "shell-true-user-input",
-        "P1",
+        "P2",
         r"shell\s*=\s*True",
         "subprocess with shell=True — potential command injection vector",
         "Use shell=False (the default) and pass arguments as a list.",

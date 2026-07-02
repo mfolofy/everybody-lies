@@ -39,3 +39,6 @@ Thumbs.db
 
 # Config (users have their own)
 ~/.everybody-lies/
+
+# Local safety backups
+everybody_lies.bak-*/

@@ -6,6 +6,7 @@ Zero hardcoded secrets — all keys come from environment variables.
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from functools import lru_cache
@@ -160,7 +161,35 @@ def detect_available_providers() -> list[str]:
     return available
 
 
+def available_fallback_models(exclude: str = "") -> list[str]:
+    """Ordered fallback models for specialists when the primary model fails.
+
+    Built from whichever provider keys are actually configured, cheapest first.
+    Used by the gatekeeper to fail over ACROSS providers (e.g. Anthropic 529
+    overload -> DeepSeek -> Gemini) instead of trying a single hardcoded model.
+    """
+    candidates: list[str] = []
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        candidates.append("deepseek-v4-flash")
+    if os.environ.get("GEMINI_API_KEY"):
+        candidates.append("gemini-2.5-flash")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        candidates.append("claude-haiku-4-5")
+        candidates.append("claude-sonnet-4-6")
+    if os.environ.get("OPENROUTER_API_KEY"):
+        candidates.append("deepseek/deepseek-v4-flash")
+    return [m for m in candidates if m != exclude]
+
+
 # ── LLM Calling ───────────────────────────────────────────────────────────────
+
+# HTTP statuses worth retrying on the SAME provider before failing over.
+# 529 = Anthropic "overloaded" — the exact failure that turned a provider
+# outage into a phantom P1 hard-block on 2026-07-01.
+_TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504, 529}
+_RETRIES_PER_PROVIDER = 2       # 1 initial attempt + 1 retry
+_RETRY_BACKOFF_S = 3.0          # short — the pre-commit hook has a 300s budget
+
 
 def call_llm(
     model: str,
@@ -245,32 +274,45 @@ def call_llm(
                 "seed": seed,
             }
 
-        try:
-            req = urllib.request.Request(
-                url, data=json.dumps(payload).encode(), headers=headers, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = json.loads(resp.read().decode())
-                if "choices" in data:
-                    msg = data["choices"][0]["message"]
-                    return (msg.get("content") or "").strip()
-                elif "candidates" in data:
-                    return (data["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
-                elif "content" in data:
-                    # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
-                    for block in data.get("content", []):
-                        if block.get("type") == "text":
-                            return (block.get("text") or "").strip()
-                    raise RuntimeError(f"No text content in Anthropic response from {model}")
-                else:
-                    raise RuntimeError(f"Unexpected response format from {model}")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")[:300]
-            last_error = f"HTTP {exc.code} from {provider['name']}: {body}"
-            continue
-        except Exception as exc:
-            last_error = str(exc)[:300]
-            continue
+        # Retry transient failures (429/5xx/529/timeouts) on the SAME provider
+        # with a short backoff before failing over to the next provider.
+        # Hard failures (401/403/404, malformed response) fail over immediately.
+        for attempt in range(_RETRIES_PER_PROVIDER):
+            try:
+                req = urllib.request.Request(
+                    url, data=json.dumps(payload).encode(), headers=headers, method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = json.loads(resp.read().decode())
+                    if "choices" in data:
+                        msg = data["choices"][0]["message"]
+                        return (msg.get("content") or "").strip()
+                    elif "candidates" in data:
+                        return (data["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+                    elif "content" in data:
+                        # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+                        for block in data.get("content", []):
+                            if block.get("type") == "text":
+                                return (block.get("text") or "").strip()
+                        raise RuntimeError(f"No text content in Anthropic response from {model}")
+                    else:
+                        raise RuntimeError(f"Unexpected response format from {model}")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                last_error = f"HTTP {exc.code} from {provider['name']}: {body}"
+                if exc.code in _TRANSIENT_HTTP and attempt < _RETRIES_PER_PROVIDER - 1:
+                    time.sleep(_RETRY_BACKOFF_S)
+                    continue  # retry same provider
+                break  # hard failure or retries exhausted -> next provider
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = str(exc)[:300]
+                if attempt < _RETRIES_PER_PROVIDER - 1:
+                    time.sleep(_RETRY_BACKOFF_S)
+                    continue  # network blip -> retry same provider
+                break
+            except Exception as exc:
+                last_error = str(exc)[:300]
+                break  # non-retryable -> next provider
 
     raise RuntimeError(f"All providers failed for '{model}'. Last error: {last_error}")
 
