@@ -258,6 +258,13 @@ def call_llm(
                     {"role": "user", "content": user_prompt},
                 ],
                 "max_tokens": max_tokens,
+                # Determinism: this payload previously omitted temperature, so
+                # Anthropic-direct — the auto-detected DEFAULT provider whenever
+                # ANTHROPIC_API_KEY is set (i.e. every Claude Code user) — ran at
+                # the API default temperature 1.0 while all other providers ran
+                # deterministic. (The Anthropic Messages API has no `seed`
+                # parameter; temperature=0 is the strongest determinism available.)
+                "temperature": temperature,
             }
         else:
             payload = {

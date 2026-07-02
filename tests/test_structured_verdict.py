@@ -175,8 +175,10 @@ def test_verdict_block_with_extra_whitespace():
     assert result["verdict"] == "APPROVE"
 
 
-def test_multiple_verdict_blocks_uses_first():
-    """If somehow two verdict blocks appear, only the first is used."""
+def test_multiple_verdict_blocks_uses_last():
+    """If two verdict blocks appear, the LAST one is authoritative — the prompt
+    says 'emit this EXACTLY at the end'. An earlier block (e.g. an echoed
+    template example) must not mask the real final verdict."""
     response = '''```verdict
 {"verdict": "APPROVE", "max_severity": "NONE", "blocking_findings": []}
 ```
@@ -189,5 +191,28 @@ Some extra text
 '''
     result = _parse_structured_verdict(response)
     assert result is not None
-    # First block wins
+    # Last block wins — the final REJECT must not be masked by the earlier APPROVE
+    assert result["verdict"] == "REJECT"
+    assert result["max_severity"] == "P1"
+
+
+def test_echoed_template_example_does_not_mask_real_verdict():
+    """Models sometimes repeat the prompt's example block before the real one.
+    The echo ('APPROVE or REJECT') parses as a conservative REJECT — it must
+    not override the model's actual final APPROVE."""
+    response = '''The required format is:
+
+```verdict
+{"verdict": "APPROVE or REJECT", "max_severity": "P1/P2/P3/P4/NONE", "blocking_findings": []}
+```
+
+## Findings
+None.
+
+```verdict
+{"verdict": "APPROVE", "max_severity": "NONE", "blocking_findings": []}
+```
+'''
+    result = _parse_structured_verdict(response)
+    assert result is not None
     assert result["verdict"] == "APPROVE"

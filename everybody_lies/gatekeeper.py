@@ -838,11 +838,16 @@ def _parse_structured_verdict(response: str) -> dict | None:
         r"```verdict\s*\n(.*?)\n```",
         re.DOTALL | re.IGNORECASE,
     )
-    match = _VERDICT_FENCE.search(response)
-    if not match:
+    # LAST block wins. The prompt instructs "emit this EXACTLY at the end" —
+    # the final block is the authoritative verdict. Models sometimes echo the
+    # template's example block ('{"verdict": "APPROVE or REJECT", ...}') before
+    # their real verdict; first-match parsed that echo as a conservative REJECT
+    # (phantom block) or let an early example APPROVE mask a real final REJECT.
+    matches = list(_VERDICT_FENCE.finditer(response))
+    if not matches:
         return None
 
-    raw = match.group(1).strip()
+    raw = matches[-1].group(1).strip()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -1240,6 +1245,22 @@ P1_PATTERNS = [
     r"P1\s*[\(\-–]\s*block(?!ing\)[*]{0,2}:?\s*[*]{0,2}\s*0)",  # P1 (blocking) but NOT any zero-count variant incl. bold "**P1 (blocking):** 0"
 ]
 
+# An EXPLICIT FAIL verdict marker, anywhere in the response. The mandated
+# summary template puts "**Verdict:** FAIL" at the END of the response, but the
+# old checks only looked at the HEAD ('"FAIL" in response[:500]') — on any
+# real-length review the verdict line was past the window, so an explicit FAIL
+# in an unstructured response silently read as a pass (false negative). The
+# bare substring also matched FAILURE/FAILED in ordinary prose (false positive).
+# FAIL must immediately follow a Verdict marker, so the template echo
+# "**Verdict:** PASS (...) or FAIL (...)" cannot fire.
+_FAIL_VERDICT_RX = re.compile(
+    r"(?:\*\*)?\bVerdict:?(?:\*\*)?\s*[:\-]?\s*FAIL\b", re.IGNORECASE)
+
+
+def _has_explicit_fail_verdict(response: str) -> bool:
+    """True when the response declares an explicit '**Verdict:** FAIL' anywhere."""
+    return bool(_FAIL_VERDICT_RX.search(response))
+
 
 def _assess_specialist_response(spec_name: str, response: str) -> dict:
     """Classify one specialist response into a gate decision.
@@ -1272,6 +1293,16 @@ def _assess_specialist_response(spec_name: str, response: str) -> dict:
                                + (", ".join(_sv["blocking_findings"][:2]) or "see review"),
                 }
             return {"blocks": True, "hard_p1": False, "finding": None}  # P2/unknown REJECT
+        if _sv.get("max_severity") == "P1":
+            # Contradiction: verdict=APPROVE but max_severity=P1. The prompt's
+            # rule is "REJECT if ANY P1" — an APPROVE that admits a P1 finding
+            # is incoherent and previously slipped through as a clean pass.
+            # Block (skepticism), but appealable — it is not a verified P1 verdict.
+            return {
+                "blocks": True, "hard_p1": False,
+                "finding": (f"{spec_name}: contradictory verdict — APPROVE with "
+                            f"max_severity P1 [appealable; not a verified P1 verdict]"),
+            }
         return {"blocks": False, "hard_p1": False, "finding": None}     # APPROVE
 
     # No structured block — heuristic scrape of unstructured text.
@@ -1281,7 +1312,7 @@ def _assess_specialist_response(spec_name: str, response: str) -> dict:
             "finding": (f"{spec_name}: possible P1 [HEURISTIC — regex scrape of an "
                         f"unstructured/degraded response; appealable, not a verified verdict]"),
         }
-    if "FAIL" in response[:500] or "VERDICT: FAIL" in response.upper()[:200]:
+    if _has_explicit_fail_verdict(response):
         return {"blocks": True, "hard_p1": False, "finding": None}
     return {"blocks": False, "hard_p1": False, "finding": None}
 
@@ -1307,7 +1338,11 @@ def _cuddy_should_block(cuddy_response: str, tier: str, p1_patterns: list[str]) 
     if has_p1:
         return True
 
-    fails = "FAIL" in cuddy_response[:500] or "FAIL" in cuddy_response.upper()[:200]
+    # Whole-response marker check — the '**Verdict:** FAIL' line lives at the
+    # END of Cuddy's mandated template; the old head-only substring check
+    # ('"FAIL" in cuddy_response[:500]') never reached it on a real-length
+    # differential, so an explicit adversarial-tier FAIL silently passed.
+    fails = _has_explicit_fail_verdict(cuddy_response)
     if not fails:
         return False
 
@@ -1789,11 +1824,14 @@ def run_review(
     scan_result = scan_diff(diff_text, files)
     original_scan_total = scan_result.total
 
-    # Apply suppression rules to scan findings (learned from dismissals)
+    # Apply suppression rules to scan findings (learned from dismissals).
+    # P1 scan findings are FACTS (secrets/tokens/keys/PII) and non-appealable
+    # by policy — a user-editable suppress.toml must not be able to launder
+    # them past the gate. Suppression applies to P2-P4 only.
     if suppression_rules:
         scan_result.findings = [
             f for f in scan_result.findings
-            if not is_suppressed(f.rule, f.file, suppression_rules)
+            if f.severity == "P1" or not is_suppressed(f.rule, f.file, suppression_rules)
         ]
     suppressed_scan_count = original_scan_total - scan_result.total
 
@@ -1819,7 +1857,16 @@ def run_review(
 
     if trivial:
         print(f"  [TRIVIAL] This diff looks trivial: {trivial_reason}")
-        if not scan_result.has_blockers:
+        # The fast-track skips AI review entirely — LOWER than any tier. It must
+        # not override a tier FLOOR raised by sensitive file patterns
+        # (**/secrets/**, **/financial/**, **/auth/**, migrations...), risk
+        # score, or HOUSE_GATE. Previously a <10-line change to a floored path
+        # fast-tracked past the very review the floor exists to guarantee.
+        _floor_requires_ai = _tier_rank.get(tier_floor, 0) > _tier_rank.get("fast", 0)
+        if _floor_requires_ai and not scan_result.has_blockers:
+            print(f"  [FAST-TRACK DENIED] Tier floor is '{tier_floor}' "
+                  f"(sensitive files/risk/gate) — trivial or not, this change gets AI review.")
+        elif not scan_result.has_blockers:
             print(f"  [FAST-TRACK] Trivial diff, no scan blockers — APPROVED without AI review.")
             # Build a minimal approval record
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1990,7 +2037,7 @@ def run_review(
                     "Cuddy: blocking — a simpler approach would obviate this code (not ruled out)"
                 )
                 all_pass = False
-            elif "FAIL" in cuddy_response.upper()[:200]:
+            elif _has_explicit_fail_verdict(cuddy_response):
                 # Advisory only on fast/standard: surfaced in synthesis, no block.
                 print("    -> Cuddy flagged approach concerns (advisory on this tier, not blocking)")
         except Exception as exc:
@@ -2152,8 +2199,23 @@ def run_review(
                     "response": response2,
                     "files_reviewed": spec_files,
                 })
-                if "P1" in response2:
-                    all_pass = False
+                # Same classifier as the primary path. The old check here was
+                # `if "P1" in response2` — a bare substring match that fired on
+                # the MANDATED zero-count summary line ("P1 (blocking): 0")
+                # present in every clean response, silently failing every
+                # adversarial-tier review. Same species as the phantom-P1 bug
+                # fixed in dc5fca4, alive in this path.
+                if _is_routing_gap_complaint(response2):
+                    print(f"    -> cross-check reported a routing gap (no content) — not blocking")
+                else:
+                    _assess = _assess_specialist_response(
+                        f"{spec['name']} (cross-check)", response2)
+                    if _assess["blocks"]:
+                        all_pass = False
+                    if _assess["finding"]:
+                        blocking_findings.append(_assess["finding"])
+                        if _assess["hard_p1"]:
+                            hard_p1_findings.append(_assess["finding"])
             except Exception as exc:
                 print(f"    -> Cross-check failed: {exc}")
 
@@ -2653,18 +2715,19 @@ def run_appeal(rfc_id: str = "", justification: str = "",
         ## Your Task
 
         Review the original findings and the agent's justification.
-        Issue your verdict: OVERRULED, UPHELD, or PARTIAL.
+        Issue your verdict: APPEAL GRANTED, APPEAL DENIED, or PARTIAL GRANT.
 
-        Structure your response as:
+        Structure your response as (first line MUST be the verdict header,
+        with exactly ONE of the three verdicts):
 
-        ## Wilson's Appeal Verdict: OVERRULED / UPHELD / PARTIAL
+        ## Wilson's Appeal Verdict: APPEAL GRANTED (or: APPEAL DENIED, PARTIAL GRANT)
 
         ## Analysis
         (For each finding the agent is appealing, analyze the justification)
 
         ## Individual Rulings
-        - Finding #1: [OVERRULED / UPHELD] — [reasoning]
-        - Finding #2: [OVERRULED / UPHELD] — [reasoning]
+        - Finding #1: [GRANTED / DENIED] — [reasoning]
+        - Finding #2: [GRANTED / DENIED] — [reasoning]
         ...
 
         ## Summary
@@ -2687,15 +2750,25 @@ def run_appeal(rfc_id: str = "", justification: str = "",
                      f"Appeal cannot be processed. Fix the original findings or try again later.")
 
     # ── Parse Wilson's verdict ────────────────────────────────────────
-    # Wilson uses GRANTED/DENIED (not the ambiguous OVERRULED/UPHELD)
-    response_upper = response.upper()
-    if "APPEAL GRANTED" in response_upper[:300] and "PARTIAL" not in response_upper[:300]:
+    # The prompt asks for APPEAL GRANTED / APPEAL DENIED / PARTIAL GRANT.
+    # OVERRULED/UPHELD are ALSO recognized as aliases: an earlier version of
+    # the prompt instructed those words while this parser only knew
+    # GRANTED/DENIED — every cleanly-"OVERRULED" (i.e. granted) appeal fell
+    # through to the DENIED default. Keep both vocabularies so a model that
+    # reverts to the courtroom phrasing still parses correctly.
+    head = response.upper()[:300]
+    if "APPEAL GRANTED" in head and "PARTIAL" not in head:
         appeal_verdict = "GRANTED"
-    elif "APPEAL DENIED" in response_upper[:300]:
+    elif "APPEAL DENIED" in head:
         appeal_verdict = "DENIED"
-    elif "PARTIAL" in response_upper[:300]:
+    elif "PARTIAL" in head:
         appeal_verdict = "PARTIAL"
-    elif "GRANTED" in response_upper[:300]:
+    elif "OVERRULED" in head and "UPHELD" not in head:
+        # Legacy phrasing: House's rejection was overruled -> appeal granted.
+        appeal_verdict = "GRANTED"
+    elif "UPHELD" in head:
+        appeal_verdict = "DENIED"
+    elif "GRANTED" in head:
         # Fallback: "GRANTED" without "APPEAL" prefix
         appeal_verdict = "GRANTED"
     else:
