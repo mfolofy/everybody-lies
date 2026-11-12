@@ -68,13 +68,13 @@ def _count_running_opencode_subagents() -> int:
         if sys.platform == "win32":
             result = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq opencode.exe", "/NH", "/FO", "CSV"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
             lines = [l for l in result.stdout.strip().splitlines() if "opencode" in l.lower()]
         else:
             result = subprocess.run(
                 ["pgrep", "-x", "opencode"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             )
             lines = result.stdout.strip().splitlines()
 
@@ -180,7 +180,7 @@ def _parse_house_gate() -> dict:
 # 1. Not server-side: we do not control CI on external remotes (some-external-remote, etc.).
 #    Server-side is ideal long-term; client-side is the only option available now.
 #
-# 2. Not shell-only: this fleet runs Windows + macOS + Linux. Shell glob matching
+# 2. Not shell-only: House runs on Windows + macOS + Linux. Shell glob matching
 #    (**) is not portable. Python is already required (Cuddy pre-flight runs Python).
 #
 # 3. New functions not scan_diff reuse: scan_diff operates on staged diffs (index).
@@ -292,7 +292,7 @@ def _new_branch_base(new_sha: str) -> str | None:
     for base in ("main", "master"):
         result = subprocess.run(
             ["git", "merge-base", base, new_sha],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
     return None
@@ -318,14 +318,14 @@ def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
             # commit (no parent) there is nothing to exclude and we list its tree.
             parents = subprocess.run(
                 ["git", "rev-list", "--parents", "-n", "1", new_sha],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
             excludes = []
             if parents.returncode == 0:
                 excludes = [f"^{p}" for p in parents.stdout.split()[1:]]
             cmd = ["git", "rev-list", "--objects", new_sha, *excludes]
     else:
         cmd = ["git", "rev-list", "--objects", f"{old_sha}..{new_sha}"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if result.returncode != 0:
         raise RuntimeError(f"git rev-list failed: {result.stderr.strip()}")
     paths = []
@@ -472,13 +472,6 @@ from .learning import (
 # Domain keywords → suggested fellow. House auto-hires when code touches
 # domains that no existing fellow covers.
 DOMAIN_HINTS = {
-    "trading": {
-        "keywords": ["trading_core", "gs-rev", "portfolio", "kelly", "position_size",
-                     "stop_loss", "take_profit", "order_book", "exchange", "binance",
-                     "kalshi", "polymarket", "alpaca", "market_data", "candle"],
-        "domain": "Crypto & Algorithmic Trading",
-        "expertise": "crypto markets, exchange APIs, order execution, risk management, Kelly criterion, technical indicators, market microstructure",
-    },
     "quant": {
         "keywords": ["backtest", "sharpe_ratio", "alpha", "volatility", "var", "cvar",
                      "monte_carlo", "regression", "time_series", "statistical", "pandas_ta",
@@ -619,7 +612,7 @@ def _hire_fellow(domain_info: dict, tier: str, board: dict) -> dict:
         "title": f"{domain} SME",
         "emoji": "🔧",
         "domains": [domain.lower()],
-        "model_overrides": {"preferred": "deepseek-v4-flash", "standard": "deepseek-v4-flash", "budget": None},
+        "model_overrides": {"preferred": "deepseek-flash", "standard": "deepseek-flash", "budget": None},
         "file_patterns": sorted(patterns),
         "review_prompt": review_prompt,
         "dynamic": True,
@@ -774,7 +767,7 @@ def _read_full_file(path: str, staged: bool) -> str:
         if staged:
             res = subprocess.run(
                 ["git", "show", f":{path}"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             )
             if res.returncode == 0:
                 content = res.stdout
@@ -1281,7 +1274,7 @@ def _assess_specialist_response(spec_name: str, response: str) -> dict:
       APPEALABLE — a reviewer that could not complete a structured review
       must never fabricate a non-appealable blocker. This is the exact bug
       that let an Anthropic 529 outage hard-block legitimate
-      subprocess-spawning mesh tooling with "P1 found (fallback regex)".
+      subprocess-spawning tooling with "P1 found (fallback regex)".
     """
     _sv = _parse_structured_verdict(response)
     if _sv is not None:
@@ -1618,7 +1611,7 @@ def _update_stats(review_data: dict) -> None:
 def _print_dry_run_prompts(diff_text: str, files: list[str], specialists: list[dict],
                            routing: dict[str, list[str]],
                            board: dict, house_config: dict) -> None:
-    """Print specialist prompts for external execution (Thor/OpenCode)."""
+    """Print specialist prompts for external execution (e.g. another agent runner)."""
     print("=" * 80)
     print("HOUSE GATEKEEPER -- DRY RUN (Prompts for External Execution)")
     print("=" * 80)
@@ -2182,7 +2175,7 @@ def run_review(
 
     # ── Adversarial cross-check ───────────────────────────────────────
     if tier == "adversarial":
-        secondary_model = "deepseek/deepseek-v4-flash"
+        secondary_model = "deepseek-flash"
         for spec in active_specialists:
             spec_files = routing.get(spec["id"], files)
             spec_diff = _filter_diff_for_files(diff_text, spec_files)
@@ -2260,9 +2253,8 @@ def run_review(
         # ALL specialists unreachable after retry + cross-provider failover.
         # That is a PROVIDER OUTAGE, not a code problem — same class as the
         # wrapper's fail-open plumbing errors. A reviewer that cannot review
-        # must degrade honestly, not block. Deterministic gates already ran:
-        # house_sanitize (secrets/gitignore, in the hook) and the pre-scan
-        # above. If those FACTS are clean, approve DEGRADED and say so loudly;
+        # must degrade honestly, not block. The deterministic pre-scan above
+        # already ran. If those FACTS are clean, approve DEGRADED and say so loudly;
         # if the scan found a P1 fact (secret/PII), still reject.
         failures = []
         for r in specialist_results:
@@ -2288,8 +2280,7 @@ def run_review(
             degraded_reason = "llm_unavailable"
             synthesis = (f"**APPROVED (DEGRADED — NO LLM REVIEW):** All {len(specialist_results)} "
                          f"specialists were unreachable (provider outage). The deterministic "
-                         f"gates ran and are clean: house_sanitize secret/gitignore gate (hook) "
-                         f"and the pre-scan ({scan_result.total} findings, 0 P1). Per policy, an "
+                         f"pre-scan ran and is clean ({scan_result.total} findings, 0 P1). Per policy, an "
                          f"external API outage must not fabricate blockers or brick the workflow "
                          f"— this commit passed FACTS-ONLY review, not an LLM review.\n\n"
                          f"Provider failures:\n{fail_detail}\n\n"
@@ -2374,7 +2365,7 @@ def run_review(
         import subprocess as _sp
         _git_log = _sp.run(
             ["git", "log", "-1", "--format=%B"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout
         submitter_key = "unknown/unknown"
         submitter_display = "Unknown"
@@ -2491,20 +2482,20 @@ def _find_latest_rejected_review() -> Path | None:
 def _get_appeal_model(board: dict) -> str | None:
     """Resolve the model for Wilson (appeal judge).
 
-    OpenRouter is BANNED for Wilson — automated workflows burned $100 in 2 days.
+    OpenRouter is never used for Wilson, so automated appeal loops cannot run up costs.
     Resolution order:
     1. chart.json appeal_judge.model — use if provider key is available
     2. chart.json appeal_judge.fallback_models — same check, skip openrouter
-    3. Any available direct provider (deepseek → gemini → anthropic), never openrouter
+    3. Any available direct provider (deepseek → anthropic), never openrouter or gemini
 
     Returns None only if no provider key is available at all.
     """
     from .providers import MODEL_ROUTING, PROVIDERS, detect_available_providers
 
     appeal_config = board.get("appeal_judge", {})
-    primary = appeal_config.get("model", "deepseek-v4-flash")
+    primary = appeal_config.get("model", "deepseek-flash")
     fallbacks = appeal_config.get("fallback_models",
-        ["deepseek-chat", "gemini-2.5-flash", "claude-sonnet-4-6"])
+        ["deepseek-flash", "gemini-2.5-flash", "claude-sonnet-4-6"])
 
     # Step 1+2: try chart-configured models — skip openrouter provider
     for model in [primary] + fallbacks:
@@ -2516,9 +2507,9 @@ def _get_appeal_model(board: dict) -> str | None:
             if provider and os.environ.get(provider["env_key"]):
                 return model
 
-    # Step 3: any available direct provider — no openrouter, no gemini (key invalid 2026-06-08)
+    # Step 3: any available direct provider — DeepSeek or Anthropic only
     _PROVIDER_BEST_MODEL = {
-        "deepseek":  "deepseek-v4-flash",
+        "deepseek":  "deepseek-flash",
         "anthropic": "claude-sonnet-4-6",
     }
     for provider_key in detect_available_providers():
@@ -2663,10 +2654,9 @@ def run_appeal(rfc_id: str = "", justification: str = "",
         print(f"\n{'=' * 70}")
         print(f"  APPEAL DEFERRED — No independent judge available")
         print(f"  RFC: {rfc_id}")
-        print(f"  Wilson requires a different provider than the review board.")
-        print(f"  No Gemini, Anthropic, or OpenAI key detected.")
-        print(f"  Appeal cannot proceed without genuine separation of powers.")
-        print(f"  Fix the findings or set an API key for a non-DeepSeek provider.")
+        print(f"  Wilson uses direct provider APIs only (DeepSeek, then Anthropic).")
+        print(f"  No DEEPSEEK_API_KEY or ANTHROPIC_API_KEY detected.")
+        print(f"  Fix the findings or set one of those keys to appeal.")
         print(f"{'=' * 70}\n")
 
         appeal_data = {
@@ -2677,7 +2667,7 @@ def run_appeal(rfc_id: str = "", justification: str = "",
             "appeal_judge": f"{wilson_name} ({wilson_title})",
             "original_verdict": original_verdict,
             "appeal_verdict": "DEFERRED",
-            "reason": "No non-DeepSeek provider available. Separation of powers requires a different provider.",
+            "reason": "No direct DeepSeek or Anthropic key available for the appeal judge.",
         }
         _log_appeal(appeal_data)
         return appeal_data
@@ -3103,12 +3093,12 @@ def run_onboarding() -> None:
         "openrouter": {"name": "OpenRouter", "models": [
             "anthropic/claude-opus-4-8",
             "anthropic/claude-sonnet-4-6",
-            "deepseek/deepseek-v4-flash",
+            # DeepSeek is routed direct-only — use the "deepseek" provider below.
             "openai/gpt-4o",
             "google/gemini-2.5-flash",
         ]},
         "deepseek": {"name": "DeepSeek Direct API", "models": [
-            "deepseek-v4-flash",
+            "deepseek-flash",
         ]},
         "gemini": {"name": "Google Gemini API", "models": [
             "gemini-2.5-flash",
@@ -3154,11 +3144,11 @@ def run_onboarding() -> None:
 
     preferred_default = "anthropic/claude-opus-4-8" if has_opus else (
         "anthropic/claude-sonnet-4-6" if has_sonnet else (
-            "deepseek/deepseek-v4-flash" if has_deepseek else available_models[0]))
-    standard_default = "deepseek/deepseek-v4-flash" if has_deepseek else (
+            "deepseek-flash" if has_deepseek else available_models[0]))
+    standard_default = "deepseek-flash" if has_deepseek else (
         "anthropic/claude-sonnet-4-6" if has_sonnet else available_models[0])
     budget_default = "google/gemini-2.5-flash" if has_gemini else (
-        "deepseek/deepseek-v4-flash" if has_deepseek else available_models[0])
+        "deepseek-flash" if has_deepseek else available_models[0])
 
     print("Auto-selected tier defaults:")
     print(f"  Preferred (adversarial tier): {preferred_default}")

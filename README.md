@@ -208,7 +208,7 @@ $ everybody-lies --staged --tier fast
   Type:   normal
 ======================================================================
 
-  [CONFIG] Auto-detected: deepseek-v4-flash via DeepSeek Direct, Gemini Direct
+  [CONFIG] Auto-detected: deepseek-flash via DeepSeek Direct, Gemini Direct
 
   [SCAN] Deterministic pre-scan: 2 files, 8 lines (1.75ms)
          3 findings: P1=2 P2=0 P3=1 P4=0
@@ -218,14 +218,14 @@ $ everybody-lies --staged --tier fast
 
   [CUDDY — DIFFERENTIAL DIAGNOSIS] Dr. Lisa Cuddy (Dean of Medicine)
   Ruling out simpler alternatives before the specialists touch this...
-  Model: deepseek-v4-flash
+  Model: deepseek-flash
     -> 3444 chars received
 
   [THIRTEEN] Dr. Remy Hadley (Thirteen) — reviewing 2 file(s)
-  Model: deepseek-v4-flash
+  Model: deepseek-flash
     -> 2708 chars received
 
-  [HOUSE] Synthesizing findings with deepseek-v4-flash...
+  [HOUSE] Synthesizing findings with deepseek-flash...
     -> 3468 chars received
 
   [REPORT] ~/.everybody-lies/reviews/house-2026-05-30-cuddy-live-test.md
@@ -324,7 +324,7 @@ HOUSE_GATE='{"subagents_running":false,"locked_decisions":"React per PRD §5","t
 HOUSE_BYPASS=1 git commit -m "hotfix: emergency deploy"
 ```
 
-House logs every bypass to `~/.everybody-lies/reviews/house-commits.jsonl`. There's an audit trail.
+House logs every bypass to `~/.everybody-lies/reviews/house-commits.jsonl` (via the post-commit hook in `docs/hooks/`). Add `HOUSE_BYPASS_REASON="..."` to record why. There's an audit trail.
 
 ## Pre-Push Scope Enforcement (Patient File)
 
@@ -407,11 +407,11 @@ House is **provider-agnostic.** Any model, any API, any endpoint. The tool ships
 | Provider | Example models | Auth |
 |----------|---------------|------|
 | **Anthropic Direct** | claude-sonnet-4-6, claude-opus-4-8, claude-haiku-4-5 | `ANTHROPIC_API_KEY` |
-| **DeepSeek Direct** | deepseek-v4-flash, deepseek-v4-pro | `DEEPSEEK_API_KEY` |
+| **DeepSeek Direct** | deepseek-flash, deepseek-v4-pro | `DEEPSEEK_API_KEY` |
 | **Gemini Direct** | gemini-2.5-flash, gemini-2.5-pro, gemini-3.5-flash | `GEMINI_API_KEY` |
 | **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek, …) | `OPENROUTER_API_KEY` |
 
-These are just the pre-configured ones. House tries direct APIs first (faster, cheaper), falls back to OpenRouter automatically (any model under the sun).
+These are just the pre-configured ones. House tries direct APIs first (faster, cheaper), falls back to OpenRouter automatically (any model under the sun). DeepSeek models are the exception: they are routed to the DeepSeek API only, never through OpenRouter.
 
 **Any OpenAI-compatible endpoint works.** Local Ollama. Azure. LiteLLM proxy. Your own model server. A cloud GPU you SSH into. House doesn't care who serves the model — he only cares what the model finds.
 
@@ -457,7 +457,7 @@ export EVERYBODY_LIES_HOME=/path/to/config
 
 ## Dynamic Specialists
 
-House auto-hires specialists for domains the static board doesn't cover. If your code touches trading, ML, blockchain, or databases — and no existing fellow covers that domain — House creates a specialist on the fly. If they produce nothing useful across 5 reviews, House fires them. It's a meritocracy. Unlike your last job.
+House auto-hires specialists for domains the static board doesn't cover. If your code touches ML, blockchain, embedded, or databases — and no existing fellow covers that domain — House creates a specialist on the fly. If they produce nothing useful across 5 reviews, House fires them. It's a meritocracy. Unlike your last job.
 
 ## Appeals
 
@@ -485,11 +485,11 @@ everybody-lies --appeal "justification" --rfc RFC-2026-06-01-pre-commit-review-r
 
 All appeals are logged to `~/.everybody-lies/reviews/appeals.jsonl`. Permanent audit trail.
 
-**Wilson requires an independent provider.** He won't use the same model family as the review board. If you only have DeepSeek configured, Wilson can't run (that's the review board's model — no separation of powers). Set `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY` to unlock appeals.
+**Wilson needs a direct provider key.** Wilson uses direct provider APIs only (DeepSeek, then Anthropic), never OpenRouter, so automated appeal loops cannot run up costs. Set `DEEPSEEK_API_KEY` or `ANTHROPIC_API_KEY` to enable appeals.
 
 ## Key Bootstrap
 
-House detects API keys from environment variables. If you're running House inside a CI pipeline, a git hook, or a multi-agent workflow where keys aren't in the environment, you have two options:
+House detects API keys from environment variables. If you're running House inside a CI pipeline, a git hook, or a multi-agent workflow where keys aren't in the environment, you have three options:
 
 **Option 1 — JSON blob via env var** (hooks, wrappers, CI):
 ```bash
@@ -514,7 +514,9 @@ export EVERYBODY_LIES_SECRETS_FILE=~/.my-keys.json
 everybody-lies --appeal "justification"
 ```
 
-Both sources are loaded at import time and never overwrite keys already in the environment.
+**Option 3 — repo-local keys file** (git hooks, zero wiring): put the same flat JSON at `secrets/house-api-keys.json` in your repo (or any parent directory) and keep it gitignored. House finds it by walking up from the working directory. A copy that is *tracked* by git is ignored, so a repo you clone cannot supply its own keys.
+
+All sources are loaded at import time and never overwrite keys already in the environment.
 
 ## Cleanup
 

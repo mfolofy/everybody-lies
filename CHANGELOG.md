@@ -5,6 +5,19 @@ All notable changes to everybody-lies will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-12
+
+### Fixed
+- Subprocess output decoded as UTF-8 (`errors="replace"`): Windows cp1252 no longer crashes on git diffs with non-ASCII text.
+- DeepSeek model ids corrected to the served ones (`deepseek-flash`, `deepseek-v4-pro`); `deepseek-v4-flash` returned empty responses.
+- DeepSeek is routed to the DeepSeek API only, never through OpenRouter.
+
+### Added
+- Key bootstrap source 3: an untracked `secrets/house-api-keys.json` found by walking up from the working directory. Tracked copies are ignored.
+
+### Removed
+- The trading-domain dynamic specialist.
+
 ## [0.3.0] - 2026-06-05
 
 ### Added
@@ -45,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pre-commit hook integration
 - Key bootstrap via `EVERYBODY_LIES_API_KEYS` env var or secrets file
 
+[0.3.1]: https://github.com/mfolofy/everybody-lies/releases/tag/v0.3.1
 [0.3.0]: https://github.com/mfolofy/everybody-lies/releases/tag/v0.3.0
 [0.2.1]: https://github.com/mfolofy/everybody-lies/releases/tag/v0.2.1
 [0.2.0]: https://github.com/mfolofy/everybody-lies/releases/tag/v0.2.0

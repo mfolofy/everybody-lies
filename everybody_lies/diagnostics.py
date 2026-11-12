@@ -271,7 +271,7 @@ def resolve_tiebreak(
     specialist_a_key: str,
     specialist_b_key: str,
     submitter_key: Optional[str] = None,
-    cuddy_key: str = "specialist/cuddy/deepseek-v4-flash",
+    cuddy_key: str = "specialist/cuddy/deepseek-flash",
 ) -> dict:
     """Determine loop tiebreak winner based on daily grades.
 

@@ -1,6 +1,6 @@
 # everybody-lies — Operations Runbook
 
-> **Version:** 0.3.0 | **Last updated:** 2026-06-05  
+> **Version:** 0.3.1 | **Last updated:** 2026-11-12  
 > **Purpose:** Full operational guide for installing, configuring, and operating House across multiple machines.
 
 ---
@@ -18,7 +18,7 @@
 ```bash
 pip install everybody-lies
 # or from GitHub Releases:
-pip install https://github.com/mfolofy/everybody-lies/releases/download/v0.3.0/everybody_lies-0.3.0-py3-none-any.whl
+pip install https://github.com/mfolofy/everybody-lies/releases/download/v0.3.1/everybody_lies-0.3.1-py3-none-any.whl
 # or from source:
 pip install -e /path/to/everybody-lies
 ```
@@ -505,28 +505,28 @@ everybody-lies --appeal "Finding already addressed in prior review round RFC-202
 
 **Symptom:** Appeals fail with message about Wilson needing a different provider.
 
-**Cause:** Wilson requires a different provider than the review board (separation of powers). If you only have DeepSeek configured, Wilson can't use DeepSeek (that's what the review board uses).
+**Cause:** Wilson uses direct provider APIs only (DeepSeek, then Anthropic). OpenRouter and Gemini are not used for appeals.
 
 **Fix:** Set at least one of:
 ```bash
-export GEMINI_API_KEY="..."
+export DEEPSEEK_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENROUTER_API_KEY="sk-or-..."
 ```
 
 ---
 
-## 8. Fleet Installation
+## 8. Multi-Machine Installation
 
 ### Single-node installation
 
 ```bash
 pip install everybody-lies
 cp docs/hooks/pre-commit /path/to/repo/.git/hooks/pre-commit && chmod +x /path/to/repo/.git/hooks/pre-commit
+cp docs/hooks/post-commit /path/to/repo/.git/hooks/post-commit && chmod +x /path/to/repo/.git/hooks/post-commit
 cp docs/hooks/pre-push /path/to/repo/.git/hooks/pre-push && chmod +x /path/to/repo/.git/hooks/pre-push
 ```
 
-### Git submodule method (recommended for fleet)
+### Git submodule method (for many repos)
 
 If everybody-lies is tracked as a git submodule in your repos:
 
@@ -535,7 +535,7 @@ git submodule update --init --remote
 pip install -e ./everybody-lies  # editable install for development
 ```
 
-### Bulk update across fleet nodes
+### Bulk update across machines
 
 ```bash
 # On each node:
@@ -550,7 +550,7 @@ for repo in /path/to/repo1 /path/to/repo2; do
 done
 ```
 
-### Verify fleet consistency
+### Verify consistency
 
 ```bash
 # Check version is the same everywhere

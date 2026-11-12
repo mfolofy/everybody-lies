@@ -1,71 +1,14 @@
-#!/usr/bin/env python
-"""House Post-Commit Hook — stamps commit SHA into house-commits.jsonl."""
-import os
-import subprocess
-import sys
-from pathlib import Path
+#!/bin/sh
+# House post-commit hook: records bypassed commits in House's audit log
+# (~/.everybody-lies/reviews/house-commits.jsonl).
+#
+# Install: cp docs/hooks/post-commit .git/hooks/post-commit && chmod +x .git/hooks/post-commit
 
-REPO_ROOT = Path(subprocess.run(
-    ["git", "rev-parse", "--show-toplevel"],
-    capture_output=True, text=True, timeout=5,
-).stdout.strip())
-
-# Real git dir — in a worktree REPO_ROOT/.git is a FILE, so resolve the actual
-# per-worktree git dir (must match the pre-commit hook's token location).
-GIT_DIR = Path(subprocess.run(
-    ["git", "rev-parse", "--git-dir"],
-    capture_output=True, text=True, timeout=5,
-).stdout.strip())
-if not GIT_DIR.is_absolute():
-    GIT_DIR = (REPO_ROOT / GIT_DIR).resolve()
-
-HOUSE_HOME = REPO_ROOT / "docs"
-
-BYPASS = os.environ.get("HOUSE_BYPASS") == "1"
-
-# Read token to find the right HOUSE_RFC file
-token_file = GIT_DIR / "HOUSE_TOKEN"
-if not token_file.exists():
-    sys.exit(0)
-
-token = token_file.read_text(encoding="utf-8").strip()
-rfc_file = GIT_DIR / f"HOUSE_RFC_{token}"
-
-if not rfc_file.exists():
-    sys.exit(0)
-
-rfc_id = rfc_file.read_text(encoding="utf-8").strip()
-
-# Get the commit SHA
-sha_result = subprocess.run(
-    ["git", "rev-parse", "HEAD"],
-    capture_output=True, text=True, cwd=REPO_ROOT, timeout=5,
-)
-commit_sha = sha_result.stdout.strip() if sha_result.returncode == 0 else ""
-
-if commit_sha:
-    if BYPASS or rfc_id == "BYPASSED":
-        subprocess.run(
-            [sys.executable, "-m", "everybody_lies",
-             "--log-bypass", commit_sha,
-             "--bypass-reason", "HOUSE_BYPASS env var set"],
-            cwd=REPO_ROOT,
-            env={"EVERYBODY_LIES_HOME": str(HOUSE_HOME)},
-            timeout=10,
-        )
-    elif rfc_id and rfc_id != "APPROVED":
-        subprocess.run(
-            [sys.executable, "-m", "everybody_lies",
-             "--stamp-commit", commit_sha,
-             "--rfc", rfc_id],
-            cwd=REPO_ROOT,
-            env={"EVERYBODY_LIES_HOME": str(HOUSE_HOME)},
-            timeout=10,
-        )
-
-# Cleanup
-for f in [rfc_file, token_file]:
-    try:
-        f.unlink()
-    except OSError:
-        pass
+[ "$HOUSE_BYPASS" = "1" ] || exit 0
+sha=$(git rev-parse HEAD) || exit 0
+for p in python3 python py; do
+    if command -v "$p" >/dev/null 2>&1 && "$p" -c "import everybody_lies" >/dev/null 2>&1; then
+        exec "$p" -m everybody_lies --log-bypass "$sha" --bypass-reason "${HOUSE_BYPASS_REASON:-unspecified}"
+    fi
+done
+exit 0

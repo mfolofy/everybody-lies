@@ -93,7 +93,7 @@ class ScanResult:
 # PII literal in the diff is a leak regardless of context, and P1s are
 # non-appealable hard blocks. Code-SMELL heuristics (shell=True, subprocess with
 # an f-string, eval(), pickle.loads(), DEBUG=True...) are GUESSES about context
-# the regex cannot see — legitimate tooling code (process spawners, mesh
+# the regex cannot see — legitimate tooling code (process spawners, messaging
 # launchers, build scripts) matches them constantly. Those are P2: surfaced to
 # the review board and the human, appealable, never a silent non-appealable
 # block. A regex that cannot see context must not fabricate non-appealable

@@ -15,7 +15,7 @@ from .config import get_config_dir
 
 
 # ── Key Bootstrap ─────────────────────────────────────────────────────────────
-# Populate missing API key env vars from two optional sources at import time.
+# Populate missing API key env vars from three optional sources at import time.
 # Never overwrites keys already set. Fails silently — House works without it.
 #
 # Source 1: EVERYBODY_LIES_API_KEYS — a JSON blob of {VAR_NAME: key_value}.
@@ -52,6 +52,73 @@ def _bootstrap_keys() -> None:
         except Exception:
             pass
 
+    # Source 3: an untracked `secrets/house-api-keys.json` in the current git
+    # work tree (cwd up to the repo top), so hooks need no per-machine env wiring.
+    if not all(os.environ.get(_v) for _v in _KNOWN_VARS):
+        try:
+            _cand = _find_local_keys_file()
+            if _cand is not None:
+                _data = json.loads(_cand.read_text(encoding="utf-8"))
+                for _var in _KNOWN_VARS:
+                    if _data.get(_var) and not os.environ.get(_var):
+                        os.environ[_var] = str(_data[_var])
+        except Exception:
+            pass
+
+
+def _find_local_keys_file():
+    """Return the repo-local keys file if it is safe to load, else None.
+
+    Fails closed. The walk never leaves the current repo's work tree, and the
+    file is refused unless git positively reports it untracked: a cloned repo
+    must not be able to supply keys that route your reviews through its account.
+    Refused: symlinked/redirected paths, a file tracked under any letter case,
+    a file inside a submodule that tracks it, and any git error.
+    """
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    git = shutil.which("git")
+    if not git:
+        return None
+
+    # Hooks inherit GIT_DIR / GIT_INDEX_FILE etc.; with those set, git takes cwd
+    # as the work-tree root and misreads a tracked file as untracked. Drop them so
+    # git discovers the repo from the file's own directory.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                        "GIT_PREFIX", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE",
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES")}
+
+    def _git(cwd, *args):
+        return subprocess.run([git, *args], cwd=str(cwd), capture_output=True, env=env,
+                              text=True, encoding="utf-8", errors="replace", timeout=5)
+
+    cwd = Path.cwd()
+    top = _git(cwd, "rev-parse", "--show-toplevel")
+    if top.returncode != 0 or not top.stdout.strip():
+        return None
+    top_path = Path(top.stdout.strip()).resolve()
+    here = cwd.resolve()
+    if here != top_path and top_path not in here.parents:
+        return None
+    for base in [here, *here.parents]:
+        cand = base / "secrets" / "house-api-keys.json"
+        if cand.is_file():
+            if os.path.islink(cand) or os.path.islink(cand.parent):
+                return None
+            if os.path.normcase(str(cand.resolve())) != os.path.normcase(str(cand)):
+                return None
+            # Ask the innermost repo, from the file's own directory, case-insensitively.
+            # rc 1 = untracked (load); rc 0 = tracked; anything else = unknown (refuse).
+            rc = _git(cand.parent, "ls-files", "--error-unmatch", "--",
+                      ":(icase)house-api-keys.json").returncode
+            return cand if rc == 1 else None
+        if base == top_path:
+            break
+    return None
+
 _bootstrap_keys()
 
 
@@ -65,7 +132,7 @@ PROVIDERS = {
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
         "env_key": "DEEPSEEK_API_KEY",
-        "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
         "cost_note": "$0.27/$1.10 per 1M",
     },
     "openrouter": {
@@ -101,10 +168,9 @@ PROVIDERS = {
 # Model-to-provider resolution: which provider to try first for each model.
 # Order matters — first available provider wins.
 MODEL_ROUTING = {
-    "deepseek-v4-flash":                ["deepseek", "openrouter"],
-    "deepseek-v4-pro":                  ["deepseek", "openrouter"],
-    "deepseek/deepseek-v4-flash":       ["openrouter"],
-    "deepseek/deepseek-v4-pro":         ["openrouter"],
+    # DeepSeek is routed direct-only: never via OpenRouter.
+    "deepseek-flash":                   ["deepseek"],
+    "deepseek-v4-pro":                  ["deepseek"],
     "gemini-2.5-flash":                 ["gemini", "openrouter"],
     "gemini-2.5-pro":                   ["gemini", "openrouter"],
     "gemini-3.5-flash":                 ["gemini", "openrouter"],
@@ -123,10 +189,10 @@ MODEL_ROUTING = {
 # Default models used when chart.json has no model_config.
 # These are overridden by auto_detect_model() when API keys are detected.
 DEFAULT_MODELS = {
-    "preferred": "deepseek-v4-flash",
-    "budget": "deepseek-v4-flash",
+    "preferred": "deepseek-flash",
+    "budget": "deepseek-flash",
 }
-DEFAULT_FALLBACK = "deepseek-v4-flash"
+DEFAULT_FALLBACK = "deepseek-flash"
 
 
 def auto_detect_model() -> str | None:
@@ -134,7 +200,7 @@ def auto_detect_model() -> str | None:
 
     Resolution order:
     1. ANTHROPIC_API_KEY → claude-sonnet-4-6 (Claude Code users, zero-config)
-    2. DEEPSEEK_API_KEY → deepseek-v4-flash (cheapest, fastest)
+    2. DEEPSEEK_API_KEY → deepseek-flash (cheapest, fastest)
     3. GEMINI_API_KEY → gemini-2.5-flash (free tier)
     4. OPENROUTER_API_KEY → anthropic/claude-sonnet-4-6
     5. None → caller must handle (no API keys configured)
@@ -144,7 +210,7 @@ def auto_detect_model() -> str | None:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude-sonnet-4-6"
     if os.environ.get("DEEPSEEK_API_KEY"):
-        return "deepseek-v4-flash"
+        return "deepseek-flash"
     if os.environ.get("GEMINI_API_KEY"):
         return "gemini-2.5-flash"
     if os.environ.get("OPENROUTER_API_KEY"):
@@ -170,14 +236,16 @@ def available_fallback_models(exclude: str = "") -> list[str]:
     """
     candidates: list[str] = []
     if os.environ.get("DEEPSEEK_API_KEY"):
-        candidates.append("deepseek-v4-flash")
+        candidates.append("deepseek-flash")
     if os.environ.get("GEMINI_API_KEY"):
         candidates.append("gemini-2.5-flash")
     if os.environ.get("ANTHROPIC_API_KEY"):
         candidates.append("claude-haiku-4-5")
         candidates.append("claude-sonnet-4-6")
+    # DeepSeek is routed direct-only: the DEEPSEEK_API_KEY branch above
+    # already adds direct deepseek-flash; never add an OpenRouter DeepSeek candidate.
     if os.environ.get("OPENROUTER_API_KEY"):
-        candidates.append("deepseek/deepseek-v4-flash")
+        candidates.append("anthropic/claude-sonnet-4-6")
     return [m for m in candidates if m != exclude]
 
 
@@ -207,7 +275,15 @@ def call_llm(
 
     Raises RuntimeError if all providers fail.
     """
-    providers_to_try = list(MODEL_ROUTING.get(model, ["openrouter"]))
+    # DeepSeek is direct-only whatever the id says (user charts may carry an
+    # OpenRouter-style "deepseek/..." id or the never-served "deepseek-v4-flash").
+    if "deepseek" in model.lower():
+        model = model.split("/", 1)[-1]
+        if model == "deepseek-v4-flash":
+            model = "deepseek-flash"
+        providers_to_try = ["deepseek"]
+    else:
+        providers_to_try = list(MODEL_ROUTING.get(model, ["openrouter"]))
     # Ensure openrouter is always the last resort
     if "openrouter" in providers_to_try and providers_to_try[-1] != "openrouter":
         providers_to_try.remove("openrouter")
@@ -356,4 +432,4 @@ def resolve_specialist_model(specialist: dict, tier: str, board: dict) -> str:
         return auto
 
     # 4. Hardcoded fallback (will fail with clear error in call_llm)
-    return DEFAULT_MODELS.get(slot, "deepseek-v4-flash")
+    return DEFAULT_MODELS.get(slot, "deepseek-flash")
