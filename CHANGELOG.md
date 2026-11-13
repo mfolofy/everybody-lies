@@ -5,6 +5,17 @@ All notable changes to everybody-lies will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Claude Code provider**: runs `claude -p` (prompt on stdin, `--model` passed through as given), so Claude Code users need no API key. Auto-detected only when `claude` is on PATH and no API key is set; force it with `model_config.provider` / `EVERYBODY_LIES_PROVIDER`.
+- **Round cap** (`limits.max_rounds`, off by default): round 2 only re-checks the earlier findings and may add new P1s; the last allowed round still failing gives verdict `STUCK`.
+- **Daily call cap** (`limits.daily_call_cap`, off by default): counted in `stats.json`; at the cap House blocks (`BLOCKED`), never approves.
+- **Repo-level chart override**: optional `.house/chart.local.json`, deep-merged over `chart.json`.
+
+### Fixed
+- Archiving a review round no longer silently skips a file when an archived one has the same name, so round counts and the loop alert keep counting past round 2.
+
 ## [0.3.1] - 2026-11-12
 
 ### Fixed

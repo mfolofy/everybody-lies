@@ -212,12 +212,12 @@ def main() -> None:
         _Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         _Path(args.output).write_text(_json.dumps(result), encoding="utf-8")
 
-    # Exit code: non-zero if REJECTED (so pre-commit hooks can block)
+    # Exit code: non-zero if REJECTED, STUCK (round cap) or BLOCKED (daily cap), so hooks block
     if not isinstance(result, dict):
         print("ERROR: run_review returned unexpected type", file=sys.stderr)
         sys.exit(1)
     verdict = result.get("verdict", "")
-    if verdict == "REJECTED":
+    if verdict in ("REJECTED", "STUCK", "BLOCKED"):
         sys.exit(1)
     elif verdict == "APPROVED" or verdict == "dry_run":
         sys.exit(0)

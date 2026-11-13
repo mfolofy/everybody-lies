@@ -477,6 +477,8 @@ from .config import (
     get_commit_log_path,
     get_archive_dir,
     ensure_config_dir,
+    apply_local_chart,
+    get_limit,
 )
 from .providers import (
     PROVIDERS,
@@ -484,7 +486,10 @@ from .providers import (
     resolve_specialist_model,
     auto_detect_model,
     detect_available_providers,
+    configured_provider,
+    claude_code_available,
 )
+from .budget import BudgetExceeded
 from .scanner import scan_diff, format_scan_result, is_trivial_diff
 from .learning import (
     load_suppression_rules,
@@ -687,6 +692,20 @@ def _load_json(path: Path) -> dict:
         sys.exit(1)
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_chart() -> dict:
+    """Load the chart: chart.json plus the optional repo-level `.house/chart.local.json`.
+
+    A malformed local override blocks (exit 1): ignoring it would silently drop
+    the limits and model choices the repo owner set.
+    """
+    board = _load_json(get_chart_path())
+    try:
+        return apply_local_chart(board)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _get_git_diff(staged: bool = False, diff_arg: str = "") -> str:
@@ -1458,6 +1477,10 @@ def _archive_old_rounds(current_md: Path, current_json: Path,
             continue
         try:
             dest = archive_dir / f.name
+            n = 1
+            while dest.exists():  # keep every round: never collide with an archived one
+                dest = archive_dir / f"{f.stem}~{n}{f.suffix}"
+                n += 1
             f.rename(dest)
             archived += 1
             # Extract round number from filename (-r1, -r2, etc.)
@@ -1468,6 +1491,66 @@ def _archive_old_rounds(current_md: Path, current_json: Path,
 
     total_rounds = len(round_numbers) + 1  # prior rounds + current
     return archived, total_rounds
+
+
+def _review_slug(title: str) -> str:
+    """Slug used in review file names (same rules as _build_output_paths)."""
+    slug = title.lower().replace(" ", "-").replace("/", "-")
+    slug = re.sub(r'[<>:"|?*\\]', '', slug)
+    slug = re.sub(r'-+', '-', slug)
+    return slug.strip("-.")[:60]
+
+
+def _prior_rounds(title: str, date_str: str) -> list[dict]:
+    """Earlier review records of the same change today, newest first.
+
+    Reads the reports in reviews/ and reviews/archive/. Counting stops at the
+    last APPROVED record: an approved change starts a fresh sequence, so a
+    later change with the same title is round 1 again.
+    """
+    slug = _review_slug(title)
+    if not slug:
+        return []
+    name_rx = re.compile(rf"^house-{re.escape(date_str)}-{re.escape(slug)}(-r\d+)?(~\d+)?\.json$")
+    records = []
+    for directory in (get_reviews_dir(), get_archive_dir()):
+        if not directory.exists():
+            continue
+        for f in directory.glob(f"house-{date_str}-*.json"):
+            if not name_rx.match(f.name):
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                mtime = f.stat().st_mtime_ns
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                records.append((str(data.get("timestamp", "")), mtime, data))
+    records.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    rounds: list[dict] = []
+    for _, _, data in records:
+        if data.get("verdict") == "APPROVED":
+            break
+        rounds.append(data)
+    return rounds
+
+
+def _round_scope_note(round_no: int, max_rounds: int, prior: list[dict]) -> str:
+    """Instruction block that narrows a later round to 'were the findings fixed?'."""
+    findings: list[str] = []
+    for record in prior[:1]:  # the round just before this one
+        findings = [str(f) for f in (record.get("round_findings") or record.get("blocking_findings", []))]
+    listed = "\n".join(f"- {f}" for f in findings) or "- (none recorded; check the diff for the problems it was rejected for)"
+    final = " This is the FINAL round." if round_no >= max_rounds else ""
+    return (
+        f"REVIEW ROUND {round_no} OF {max_rounds}.{final} This change was already reviewed and "
+        f"rejected. Blocking findings from the previous round:\n{listed}\n\n"
+        f"Your ONLY tasks in this round: (1) for each finding above, say whether it is now FIXED "
+        f"or STILL PRESENT in the diff; (2) report a NEW finding only if it is P1 (security hole, "
+        f"data loss, secret exposure, or a crash on the main path). Do NOT raise new P2, P3 or P4 "
+        f"findings. Reject only if an earlier finding is still present or you found a new P1.\n\n"
+        f"--- DIFF UNDER REVIEW ---\n"
+    )
 
 
 # Keep old name as alias for the fast-track path that still uses it
@@ -1708,6 +1791,46 @@ def run_review(
     spec_mode: bool = False,
     spec_file: Optional[str] = None,
 ) -> dict:
+    """Run the House review. Fails closed when the optional daily call cap is hit.
+
+    Wraps _run_review_pipeline: BudgetExceeded (raised by call_llm before a
+    model call) ends the run with verdict BLOCKED, never an approval.
+    """
+    try:
+        return _run_review_pipeline(
+            diff_text=diff_text, files=files, tier=tier, tier_explicit=tier_explicit,
+            title=title, change_type=change_type, staged=staged, dry_run=dry_run,
+            max_tokens=max_tokens, ci_mode=ci_mode, spec_mode=spec_mode, spec_file=spec_file,
+        )
+    except BudgetExceeded as exc:
+        print(f"\n{'=' * 70}")
+        print(f"  [BLOCKED] VERDICT: BLOCKED -- daily model-call cap reached")
+        print(f"  {exc}")
+        print(f"  No further model calls were made. This change was NOT approved.")
+        print(f"{'=' * 70}\n")
+        return {
+            "status": "budget_exceeded",
+            "verdict": "BLOCKED",
+            "reason": str(exc),
+            "blocking_findings": [str(exc)],
+            "hard_p1": False,
+        }
+
+
+def _run_review_pipeline(
+    diff_text: str = "",
+    files: Optional[list[str]] = None,
+    tier: str = "standard",
+    tier_explicit: bool = False,
+    title: str = "",
+    change_type: str = "normal",
+    staged: bool = False,
+    dry_run: bool = False,
+    max_tokens: int = 4096,
+    ci_mode: Optional[str] = None,
+    spec_mode: bool = False,
+    spec_file: Optional[str] = None,
+) -> dict:
     """Run the full House gatekeeper review pipeline.
 
     Returns a dict with the complete review data (verdict, findings, RFC record).
@@ -1722,9 +1845,23 @@ def run_review(
     # ── Cuddy pre-flight: no stale subagents ─────────────────────────────
     _check_no_running_subagents()
 
-    board = _load_json(get_chart_path())
+    board = _load_chart()
     house_config = board["gatekeeper"]
     static_specialists = board.get("specialists", [])
+
+    # Optional limits and provider choice: validate up front, never ignore a typo.
+    try:
+        max_rounds = get_limit(board, "max_rounds", "EVERYBODY_LIES_MAX_ROUNDS")
+        get_limit(board, "daily_call_cap", "EVERYBODY_LIES_DAILY_CALL_CAP")
+        forced_provider = configured_provider()
+    except ValueError as exc:
+        print(f"ERROR: invalid House configuration: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if forced_provider == "claude-code" and not dry_run and not claude_code_available():
+        print("ERROR: model_config.provider is \"claude-code\" but `claude` is not on PATH. "
+              "Install Claude Code (and check `claude --version` works in this shell), "
+              "or unset the provider.", file=sys.stderr)
+        sys.exit(1)
 
     # ── Detect domain gaps + auto-hire dynamic fellows ─────────────────
     if files or diff_text:
@@ -1820,7 +1957,7 @@ def run_review(
             provider_names = [PROVIDERS[p]["name"] for p in available]
             model_info = f" ({auto_model})" if auto_model else ""
             print(f"  [CONFIG] Auto-detected:{model_info} via {', '.join(provider_names)}")
-            missing = [p for p in PROVIDERS if p not in available]
+            missing = [p for p in PROVIDERS if p not in available and PROVIDERS[p].get("env_key")]
             if missing:
                 optional_names = [f"{PROVIDERS[p]['env_key']}" for p in missing]
                 print(f"  [CONFIG] Optional: set {' or '.join(optional_names)} for cheaper/faster routing")
@@ -1829,7 +1966,10 @@ def run_review(
             print(f"  NO API KEYS DETECTED")
             print(f"  Set at least one of:")
             for p_key, p_info in PROVIDERS.items():
+                if not p_info.get("env_key"):
+                    continue
                 print(f"    export {p_info['env_key']}=\"your-key\"   # {p_info['name']} ({p_info['cost_note']})")
+            print(f"  or install Claude Code and put `claude` on PATH (no API key needed)")
             print(f"")
             print(f"  Claude Code users: your ANTHROPIC_API_KEY is already set in your env.")
             print(f"  If running as a Claude Code skill, subagents inherit your model automatically.")
@@ -1928,6 +2068,30 @@ def run_review(
     if dry_run:
         _print_dry_run_prompts(diff_text, files, specialists, routing, board, house_config)
         return {"status": "dry_run", "verdict": "dry_run", "routing": routing}
+
+    # Round cap (optional; off unless limits.max_rounds / EVERYBODY_LIES_MAX_ROUNDS is set).
+    prior_rounds = _prior_rounds(title, datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    round_no = len(prior_rounds) + 1
+    round_note = ""
+    if max_rounds:
+        if round_no > max_rounds:
+            stuck_msg = (f"Round cap reached: {len(prior_rounds)} review round(s) of this change already "
+                         f"failed (max_rounds={max_rounds}). It needs a person, not another round.")
+            print(f"\n{'=' * 70}")
+            print(f"  [STUCK] VERDICT: STUCK -- needs a person")
+            print(f"  {stuck_msg}")
+            print(f"  Fix the open findings by hand, then re-run with EVERYBODY_LIES_MAX_ROUNDS=0 "
+                  f"(no cap) or a higher number, or bypass per docs/OPERATIONS.md.")
+            print(f"{'=' * 70}\n")
+            return {
+                "status": "stuck", "verdict": "STUCK", "reason": stuck_msg,
+                "round": round_no, "max_rounds": max_rounds,
+                "blocking_findings": [stuck_msg], "hard_p1": False,
+            }
+        if round_no >= 2:
+            round_note = _round_scope_note(round_no, max_rounds, prior_rounds)
+            print(f"  [ROUNDS] Round {round_no} of {max_rounds}: reviewing whether the earlier "
+                  f"findings were fixed; only new P1s may be added")
 
     # ── Spec Detection ────────────────────────────────────────────────
     # Auto-detect spec files for Cuddy's differential diagnosis.
@@ -2036,7 +2200,7 @@ def run_review(
             print(f"  [HISTORY] Injected prior APPROVED rulings into Cuddy context")
 
         _cuddy_full_ctx = _build_full_file_context(files, staged)
-        _cuddy_input = diff_text + ("\n" + _cuddy_full_ctx if _cuddy_full_ctx else "")
+        _cuddy_input = round_note + diff_text + ("\n" + _cuddy_full_ctx if _cuddy_full_ctx else "")
         try:
             cuddy_id, cuddy_model_used, cuddy_response = _call_cuddy(
                 cuddy_spec, cuddy_model, _cuddy_input, max_tokens, spec_content,
@@ -2062,6 +2226,8 @@ def run_review(
             elif _has_explicit_fail_verdict(cuddy_response):
                 # Advisory only on fast/standard: surfaced in synthesis, no block.
                 print("    -> Cuddy flagged approach concerns (advisory on this tier, not blocking)")
+        except BudgetExceeded:
+            raise  # fail closed: never degrade a spent budget into an approval
         except Exception as exc:
             print(f"    -> Cuddy unavailable: {exc}")
             cuddy_finding = {
@@ -2109,7 +2275,7 @@ def run_review(
         # Give the reviewer the full post-change file content so claims about
         # symbols/guards/flow can be verified instead of hallucinated.
         _full_ctx = _build_full_file_context(spec_files, staged)
-        spec_input = spec_diff + ("\n" + _full_ctx if _full_ctx else "")
+        spec_input = round_note + spec_diff + ("\n" + _full_ctx if _full_ctx else "")
 
         try:
             spec_id, model_used, response = _call_specialist(spec, model, spec_input, max_tokens)
@@ -2154,6 +2320,8 @@ def run_review(
                     if findings_count > 0:
                         _dynamic_fellows[fid]["unique_findings"] = _dynamic_fellows[fid].get("unique_findings", 0) + findings_count
 
+        except BudgetExceeded:
+            raise
         except Exception as exc:
             print(f"    -> FAILED: {exc}")
             # Fail over ACROSS providers (call_llm already retried transient
@@ -2189,6 +2357,8 @@ def run_review(
                                 hard_p1_findings.append(_assess["finding"])
                     recovered = True
                     break
+                except BudgetExceeded:
+                    raise
                 except Exception as exc2:
                     print(f"    -> Fallback {fallback} also failed: {exc2}")
             if recovered:
@@ -2204,7 +2374,8 @@ def run_review(
 
     # ── Adversarial cross-check ───────────────────────────────────────
     if tier == "adversarial":
-        secondary_model = "deepseek-flash"
+        secondary_model = ("deepseek-flash" if forced_provider != "claude-code"
+                           else resolve_specialist_model({}, "fast", board))
         for spec in active_specialists:
             spec_files = routing.get(spec["id"], files)
             spec_diff = _filter_diff_for_files(diff_text, spec_files)
@@ -2212,7 +2383,7 @@ def run_review(
                 continue
             print(f"\n  [CROSS-CHECK] {spec['name']} -- adversarial cross-check with {secondary_model}...")
             try:
-                _, model_used, response2 = _call_specialist(spec, secondary_model, spec_diff, max_tokens)
+                _, model_used, response2 = _call_specialist(spec, secondary_model, round_note + spec_diff, max_tokens)
                 print(f"    -> {len(response2)} chars received")
                 specialist_results.append({
                     "specialist_id": spec["id"],
@@ -2238,6 +2409,8 @@ def run_review(
                         blocking_findings.append(_assess["finding"])
                         if _assess["hard_p1"]:
                             hard_p1_findings.append(_assess["finding"])
+            except BudgetExceeded:
+                raise
             except Exception as exc:
                 print(f"    -> Cross-check failed: {exc}")
 
@@ -2268,8 +2441,11 @@ def run_review(
     print(f"\n  [HOUSE] Synthesizing findings with {synthesis_model}...")
 
     try:
-        synthesis = _call_house_synthesis(house_config, specialist_results, cuddy_finding, scan_result, problem_alerts, suppression_suggestions, synthesis_model, title, max_tokens)
+        synthesis = _call_house_synthesis(house_config, specialist_results, cuddy_finding, scan_result, problem_alerts, suppression_suggestions, synthesis_model,
+                                       (f"{title}\n\n{round_note.strip()}" if round_note else title), max_tokens)
         print(f"    -> {len(synthesis)} chars received")
+    except BudgetExceeded:
+        raise
     except Exception as exc:
         print(f"    -> House synthesis failed: {exc}")
         synthesis = f"**ERROR:** House synthesis unavailable. {exc}\n\nManual verdict required from Orchestrator."
@@ -2291,7 +2467,7 @@ def run_review(
             if "ERROR" in resp or "FAILED" in resp or "unavailable" in resp.lower():
                 failures.append(f"- {r['specialist_name']}: {resp[:200]}")
         fail_detail = "\n".join(failures) if failures else "Unknown — all specialists failed to respond."
-        provider_names = ', '.join(PROVIDERS[p]['env_key'] for p in PROVIDERS)
+        provider_names = ', '.join(PROVIDERS[p]['env_key'] for p in PROVIDERS if PROVIDERS[p].get('env_key'))
         if scan_result.p1_count > 0 or blocking_findings:
             verdict = "REJECTED"
             if scan_result.p1_count > 0:
@@ -2324,6 +2500,23 @@ def run_review(
     else:
         verdict = "REJECTED"
 
+    # What a later round must re-check: gate blockers plus each rejecting specialist's own list.
+    round_findings: list[str] = list(blocking_findings)
+    for _r in specialist_results:
+        _sv = _parse_structured_verdict(_r.get("response", "") or "")
+        if _sv and _sv.get("verdict") == "REJECT":
+            for _f in _sv.get("blocking_findings", [])[:5]:
+                _line = f"{_r['specialist_name']}: {_f}"
+                if _line not in round_findings:
+                    round_findings.append(_line)
+
+    # Round cap: the last allowed round still failing is STUCK (blocks; needs a person).
+    stuck_note = ""
+    if max_rounds and verdict == "REJECTED" and round_no >= max_rounds:
+        verdict = "STUCK"
+        stuck_note = (f"Round {round_no} of {max_rounds} still fails. House will not run another "
+                      f"round: this needs a person.")
+
     # ── Build output ──────────────────────────────────────────────────
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     md_path, json_path = _build_output_paths(title)
@@ -2353,6 +2546,10 @@ def run_review(
             for r in specialist_results
         ],
         "verdict": verdict,
+        "round": round_no,
+        "max_rounds": max_rounds,
+        "stuck": stuck_note or None,
+        "round_findings": round_findings,
         # Structured appealability record (rebuild 2026-07-01): hard_p1 is True
         # ONLY for P1s from structured LLM verdicts or deterministic scan facts.
         # run_appeal trusts this over regex-scraping the markdown report.
@@ -2376,6 +2573,7 @@ def run_review(
                                                   datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     if archived > 0:
         print(f"  [ARCHIVE] Archived {archived} prior round(s) -> reviews/archive/")
+    total_rounds = max(total_rounds, round_no)  # the archive alone undercounts across days of reruns
     if total_rounds > 1:
         print(f"  [ROUNDS]  This change took {total_rounds} review round(s)")
 
@@ -2390,7 +2588,7 @@ def run_review(
             record_commit_event, parse_findings_from_md,
             specialist_key as _skey, parse_attribution,
         )
-        loop_detected = total_rounds >= 3 and verdict == "REJECTED"
+        loop_detected = total_rounds >= 3 and verdict in ("REJECTED", "STUCK")
         import subprocess as _sp
         _git_log = _sp.run(
             ["git", "log", "-1", "--format=%B"],
@@ -2442,14 +2640,24 @@ def run_review(
         # Write commit log entry (commit SHA filled in by post-commit hook)
         _write_commit_log_entry(review_data, verdict="APPROVED", bypassed=False)
     else:
-        print(f"  [REJECTED] VERDICT: REJECTED")
+        if verdict == "STUCK":
+            print(f"  [STUCK] VERDICT: STUCK -- needs a person")
+            print(f"  {stuck_note}")
+            for _f in round_findings:
+                if _f not in blocking_findings:
+                    print(f"  OPEN: {_f}")
+        else:
+            print(f"  [REJECTED] VERDICT: REJECTED")
         if blocking_findings:
             for bf in blocking_findings:
                 print(f"  BLOCKER: {bf}")
         # Non-appealable ONLY for hard P1s (structured LLM verdict / scan facts).
         # Heuristic scrape findings are blocking but appealable — a degraded
         # reviewer must not fabricate non-appealable verdicts.
-        if hard_p1_findings:
+        if verdict == "STUCK":
+            print(f"  Fix the open findings by hand, then re-run with EVERYBODY_LIES_MAX_ROUNDS=0 "
+                  f"(no cap) or a higher number, or bypass per docs/OPERATIONS.md.")
+        elif hard_p1_findings:
             print(f"  P1 findings — not appealable. Fix them. Not even Wilson can help you.")
         else:
             print(f"  No hard P1 findings — may appeal to Wilson: everybody-lies --appeal \"justification\" --rfc {review_data.get('rfc_id', 'RFC-unknown')}")
@@ -2519,7 +2727,7 @@ def _get_appeal_model(board: dict) -> str | None:
 
     Returns None only if no provider key is available at all.
     """
-    from .providers import MODEL_ROUTING, PROVIDERS, detect_available_providers
+    from .providers import MODEL_ROUTING, PROVIDERS, detect_available_providers, provider_available
 
     appeal_config = board.get("appeal_judge", {})
     primary = appeal_config.get("model", "deepseek-flash")
@@ -2532,14 +2740,14 @@ def _get_appeal_model(board: dict) -> str | None:
         for provider_key in route:
             if provider_key == "openrouter":
                 continue  # never use openrouter for Wilson
-            provider = PROVIDERS.get(provider_key)
-            if provider and os.environ.get(provider["env_key"]):
+            if provider_available(provider_key):
                 return model
 
     # Step 3: any available direct provider — DeepSeek or Anthropic only
     _PROVIDER_BEST_MODEL = {
         "deepseek":  "deepseek-flash",
         "anthropic": "claude-sonnet-4-6",
+        "claude-code": "claude-sonnet-5-5",
     }
     for provider_key in detect_available_providers():
         if provider_key not in ("openrouter", "gemini") and provider_key in _PROVIDER_BEST_MODEL:
@@ -2604,7 +2812,7 @@ def run_appeal(rfc_id: str = "", justification: str = "",
 
     Returns a dict with the appeal verdict and reasoning.
     """
-    board = _load_json(get_chart_path())
+    board = _load_chart()
     appeal_config = board.get("appeal_judge", {})
 
     # ── Find the review ───────────────────────────────────────────────

@@ -108,6 +108,46 @@ Key sections in `chart.json`:
 | `tier_floors` | File patterns and risk score floors (see Section 5) |
 | `dynamic_fellows` | Auto-hire/fire settings for uncovered domains |
 
+### Repo-level override: `.house/chart.local.json`
+
+Optional. Place it in the repo root (next to `.house/patients.json`); House deep-merges it over the chart above on every run, so you only write what differs. Objects merge key by key, lists of objects with an `id` (such as `specialists`) merge by id, anything else is replaced. A file that is not valid JSON blocks the run (exit 1) rather than being ignored. Keep it out of git with `.git/info/exclude` if it holds your private model choices. Treat it like a hook: do not run House in a repo you do not trust if it carries one.
+
+```json
+{
+  "model_config": {
+    "provider": "claude-code",
+    "tier_defaults": { "preferred": "claude-sonnet-5-5", "budget": "claude-haiku-5-5" },
+    "house_model":   { "preferred": "claude-opus-5-5", "standard": "claude-opus-5-5", "budget": "claude-opus-5-5" }
+  },
+  "specialists": [ { "id": "cuddy", "model_overrides": { "preferred": "claude-opus-5-5", "standard": "claude-opus-5-5", "budget": "claude-opus-5-5" } } ],
+  "appeal_judge": { "model": "claude-fable-5-2", "fallback_models": [] },
+  "limits": { "max_rounds": 2, "daily_call_cap": 60 }
+}
+```
+
+### Claude Code provider (`claude -p`, no API key)
+
+| Key / variable | Default | Meaning |
+|---|---|---|
+| `model_config.provider` / `EVERYBODY_LIES_PROVIDER` | unset | `"claude-code"` sends every model call through the local `claude` CLI. Unset or `"auto"` = normal routing. Any other value blocks with an error. |
+| `EVERYBODY_LIES_CLAUDE_TIMEOUT` | `240` | Seconds allowed for one `claude -p` call. |
+
+Auto-detection: when `claude` is on PATH **and** no API key variable is set, House uses it with `claude-sonnet-5-5`. Users with keys are unaffected. The call is `claude -p --model <id> --output-format text` with the prompt on stdin, run in an empty temp directory. Model ids are passed through unchanged. With `provider` set but `claude` missing from PATH, House exits 1 with a message. There is no cross-provider failover in this mode. Wilson (appeals) uses the CLI too when his configured model routes to it.
+
+### Round cap (`limits.max_rounds`, default unset)
+
+Rounds are counted per change (same title, same UTC day) across `reviews/` and `reviews/archive/`; an APPROVED review starts a new count. With `max_rounds: 2`:
+
+1. Round 1 runs as usual.
+2. Round 2 is told the previous round's findings and may only report whether each is FIXED or STILL PRESENT, plus new P1 findings (no new P2/P3/P4).
+3. If round 2 still fails the verdict is **STUCK**: exit 1, listed as `OPEN:` lines, no appeal (a person decides). A third attempt returns STUCK straight away, with no model calls.
+
+To continue anyway, fix by hand and re-run with `EVERYBODY_LIES_MAX_ROUNDS=0` (or a higher number), or use a bypass (section 4).
+
+### Daily call cap (`limits.daily_call_cap`, default unset)
+
+Counts model calls per UTC day in `~/.everybody-lies/stats.json` (`usage`, last 14 days kept; only counted while a cap is set). The call after the cap is not made: the run ends with verdict **BLOCKED** (exit 1) and the message says how to override (`EVERYBODY_LIES_DAILY_CALL_CAP=<higher number>`, `0` = no cap, or edit `limits.daily_call_cap`). It cannot turn into the "providers unreachable, approved degraded" path. A request for an appeal after the cap is hit is denied the same way. Tokens are not capped because House does not estimate them.
+
 ### patients.json (pre-push scope enforcement)
 
 Create `.house/patients.json` in your repo root. Template at `docs/patients.example.json`. Full schema reference in [Section 6](#6-patient-file-reference).
@@ -190,7 +230,7 @@ Full reports saved to `~/.everybody-lies/reviews/house-YYYY-MM-DD-<slug>.md` and
 | Exit code | Meaning |
 |-----------|---------|
 | **0** | APPROVED — proceed with commit/push |
-| **1** | REJECTED — fix findings or appeal |
+| **1** | REJECTED — fix findings or appeal. Also STUCK (round cap reached, needs a person) and BLOCKED (daily call cap reached) |
 | **2** | ERROR — configuration/network issue |
 
 ---

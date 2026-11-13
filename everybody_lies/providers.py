@@ -6,12 +6,16 @@ Zero hardcoded secrets — all keys come from environment variables.
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from functools import lru_cache
 
-from .config import get_config_dir
+from .budget import check_and_record_call
+from .config import get_config_dir, load_chart
 
 
 # ── Key Bootstrap ─────────────────────────────────────────────────────────────
@@ -163,6 +167,14 @@ PROVIDERS = {
         "models": ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"],
         "cost_note": "$3/$15 per 1M",
     },
+    "claude-code": {
+        "name": "Claude Code CLI",
+        "cli": "claude",            # executable looked up on PATH; no API key needed
+        "env_key": "",
+        "api_format": "cli",
+        "models": ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2"],
+        "cost_note": "uses your Claude Code login (no API key)",
+    },
 }
 
 # Model-to-provider resolution: which provider to try first for each model.
@@ -184,6 +196,11 @@ MODEL_ROUTING = {
     "claude-sonnet-4-6":                ["anthropic", "openrouter"],
     "claude-opus-4-8":                  ["anthropic", "openrouter"],
     "claude-haiku-4-5":                 ["anthropic", "openrouter"],
+    # Claude Code CLI (`claude -p`) -- no API key; model ids pass through as given
+    "claude-sonnet-5-5":                ["claude-code"],
+    "claude-opus-5-5":                  ["claude-code"],
+    "claude-haiku-5-5":                 ["claude-code"],
+    "claude-fable-5-2":                 ["claude-code"],
 }
 
 # Default models used when chart.json has no model_config.
@@ -203,9 +220,10 @@ def auto_detect_model() -> str | None:
     2. DEEPSEEK_API_KEY → deepseek-flash (cheapest, fastest)
     3. GEMINI_API_KEY → gemini-2.5-flash (free tier)
     4. OPENROUTER_API_KEY → anthropic/claude-sonnet-4-6
-    5. None → caller must handle (no API keys configured)
+    5. `claude` on PATH (and none of the above) → claude-sonnet-5-5 via Claude Code
+    6. None → caller must handle (no API keys configured)
 
-    Returns a model ID string, or None if no keys are configured.
+    Returns a model ID string, or None if nothing is configured.
     """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "claude-sonnet-4-6"
@@ -215,15 +233,63 @@ def auto_detect_model() -> str | None:
         return "gemini-2.5-flash"
     if os.environ.get("OPENROUTER_API_KEY"):
         return "anthropic/claude-sonnet-4-6"
+    if claude_code_available():
+        return "claude-sonnet-5-5"
     return None
 
 
+def claude_code_available() -> bool:
+    """True when the Claude Code CLI (`claude`) is on PATH."""
+    return shutil.which(PROVIDERS["claude-code"]["cli"]) is not None
+
+
+def provider_available(key: str) -> bool:
+    """True when this provider can be called right now (API key set, or CLI on PATH)."""
+    provider = PROVIDERS.get(key)
+    if not provider:
+        return False
+    if provider.get("cli"):
+        return shutil.which(provider["cli"]) is not None
+    return bool(os.environ.get(provider["env_key"]))
+
+
+def configured_provider() -> str | None:
+    """The provider forced by config, or None for normal routing.
+
+    EVERYBODY_LIES_PROVIDER wins over `model_config.provider` in the chart
+    (or `.house/chart.local.json`). Only "claude-code" can be forced; unset,
+    empty or "auto" means normal routing. Anything else raises ValueError.
+    """
+    value = os.environ.get("EVERYBODY_LIES_PROVIDER", "").strip()
+    if not value:
+        try:
+            value = str(load_chart().get("model_config", {}).get("provider") or "").strip()
+        except (OSError, ValueError):
+            value = ""
+    value = value.lower()
+    if value in ("", "auto", "none", "null"):
+        return None
+    if value != "claude-code":
+        raise ValueError(
+            f"unknown provider {value!r} in model_config.provider; "
+            f"use \"claude-code\" or leave it unset"
+        )
+    return value
+
+
 def detect_available_providers() -> list[str]:
-    """Return list of provider keys that have API keys configured."""
+    """Return list of provider keys that are usable.
+
+    API-key providers appear when their key is set. The Claude Code CLI appears
+    only when `claude` is on PATH AND no API-key provider is configured, so
+    existing users with keys see no change.
+    """
     available = []
     for key, provider in PROVIDERS.items():
-        if os.environ.get(provider["env_key"]):
+        if provider.get("env_key") and os.environ.get(provider["env_key"]):
             available.append(key)
+    if not available and claude_code_available():
+        available.append("claude-code")
     return available
 
 
@@ -235,6 +301,11 @@ def available_fallback_models(exclude: str = "") -> list[str]:
     overload -> DeepSeek -> Gemini) instead of trying a single hardcoded model.
     """
     candidates: list[str] = []
+    try:
+        if configured_provider() == "claude-code":
+            return []  # CLI-only: no cross-provider failover
+    except ValueError:
+        pass
     if os.environ.get("DEEPSEEK_API_KEY"):
         candidates.append("deepseek-flash")
     if os.environ.get("GEMINI_API_KEY"):
@@ -257,6 +328,50 @@ def available_fallback_models(exclude: str = "") -> list[str]:
 _TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504, 529}
 _RETRIES_PER_PROVIDER = 2       # 1 initial attempt + 1 retry
 _RETRY_BACKOFF_S = 3.0          # short — the pre-commit hook has a 300s budget
+_CLAUDE_TIMEOUT_S = 240         # one `claude -p` call; override: EVERYBODY_LIES_CLAUDE_TIMEOUT
+
+
+def _call_claude_code(model: str, system_prompt: str, user_prompt: str) -> str:
+    """Run one review prompt through the local Claude Code CLI in print mode.
+
+    The prompt goes in on stdin (argv hits Windows command-line length limits),
+    the model id is passed through as given, output is plain text. The CLI runs
+    in an empty temp directory so no repository CLAUDE.md or settings leak into
+    the reviewer's context. Raises RuntimeError with a plain message on failure.
+    """
+    exe = shutil.which(PROVIDERS["claude-code"]["cli"])
+    if not exe:
+        raise RuntimeError(
+            "Claude Code CLI not found: `claude` is not on PATH. Install Claude Code and "
+            "make sure `claude` runs in this shell, or unset model_config.provider / "
+            "EVERYBODY_LIES_PROVIDER and use an API key provider."
+        )
+    try:
+        timeout = float(os.environ.get("EVERYBODY_LIES_CLAUDE_TIMEOUT") or _CLAUDE_TIMEOUT_S)
+    except ValueError:
+        timeout = float(_CLAUDE_TIMEOUT_S)
+    prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="house-claude-") as workdir:
+            proc = subprocess.run(
+                # A reviewer only reads the prompt and answers: no tools, no MCP
+                # servers, nothing saved as a resumable session.
+                [exe, "-p", "--model", model, "--output-format", "text",
+                 "--tools", "", "--strict-mcp-config", "--no-session-persistence"],
+                input=prompt, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout, cwd=workdir,
+            )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"`claude -p` timed out after {timeout:.0f}s (model {model})") from None
+    except OSError as exc:
+        raise RuntimeError(f"could not run `claude`: {exc}") from None
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise RuntimeError(f"`claude -p` exited with code {proc.returncode} (model {model}): {detail}")
+    out = (proc.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"`claude -p` returned no output (model {model})")
+    return out
 
 
 def call_llm(
@@ -273,11 +388,22 @@ def call_llm(
     Tries each provider in MODEL_ROUTING chain until one succeeds.
     Direct APIs first (cheaper, faster), OpenRouter as universal fallback.
 
-    Raises RuntimeError if all providers fail.
+    Raises RuntimeError if all providers fail. Raises BudgetExceeded (a
+    RuntimeError) before any call when the optional daily call cap is used up.
     """
+    check_and_record_call()  # fail closed: no model call past the daily cap
+
+    # model_config.provider = "claude-code" sends every model through the CLI.
+    try:
+        forced = configured_provider()
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+
     # DeepSeek is direct-only whatever the id says (user charts may carry an
     # OpenRouter-style "deepseek/..." id or the never-served "deepseek-v4-flash").
-    if "deepseek" in model.lower():
+    if forced:
+        providers_to_try = [forced]
+    elif "deepseek" in model.lower():
         model = model.split("/", 1)[-1]
         if model == "deepseek-v4-flash":
             model = "deepseek-flash"
@@ -294,6 +420,13 @@ def call_llm(
         provider = PROVIDERS.get(provider_key)
         if not provider:
             continue
+
+        if provider_key == "claude-code":
+            try:
+                return _call_claude_code(model, system_prompt, user_prompt)
+            except RuntimeError as exc:
+                last_error = str(exc)[:300]
+                continue
 
         # Only use the passed api_key for the FIRST provider in the chain.
         # Fallback providers must use their own env vars — forwarding a

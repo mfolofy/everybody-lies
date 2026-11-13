@@ -4,6 +4,8 @@
   "model_config": {
     "_description": "Model assignment system. Each specialist can override the global defaults per slot. Tiers map to slots: adversarial->preferred, standard->standard, fast->budget. During onboarding, users are asked which API keys they have and models are auto-selected from available providers.",
     "_onboarding": "Run: python -m everybody_lies --onboard",
+    "provider": null,
+    "_provider": "null = normal routing (API keys, or the Claude Code CLI when no key is set). \"claude-code\" = send every model call through the local `claude -p` CLI (no API key); model ids are passed through as given. Env override: EVERYBODY_LIES_PROVIDER.",
     "tier_to_slot": {
       "_comment": "adversarial & standard both use Preferred (Pro); fast uses Budget (Flash)",
       "adversarial": "preferred",
@@ -28,6 +30,13 @@
       "taub": "DeepSeek V4 Pro — API contract review, schema validation, consistency enforcement.",
       "thirteen": "DeepSeek V4 Pro — edge case discovery, race condition analysis, input boundary testing."
     }
+  },
+  "limits": {
+    "_description": "Optional safety limits. null = off (today's behaviour). Env overrides: EVERYBODY_LIES_MAX_ROUNDS, EVERYBODY_LIES_DAILY_CALL_CAP (0 or off = no limit).",
+    "max_rounds": null,
+    "_max_rounds": "Review rounds allowed per change per day. Round 2+ only checks whether the earlier findings were fixed and may add new P1s only. The last allowed round still failing gives verdict STUCK (blocks, needs a person).",
+    "daily_call_cap": null,
+    "_daily_call_cap": "Model calls allowed per UTC day, counted in stats.json. When used up, House blocks (verdict BLOCKED), never approves."
   },
   "dynamic_fellows": {
     "_description": "House has autonomy to hire/fire specialists for uncovered domains. When code touches a domain no existing fellow covers, House auto-generates a domain-specific specialist with appropriate review prompts and the best available model.",

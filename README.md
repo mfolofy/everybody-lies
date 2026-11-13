@@ -410,6 +410,7 @@ House is **provider-agnostic.** Any model, any API, any endpoint. The tool ships
 | **DeepSeek Direct** | deepseek-flash, deepseek-v4-pro | `DEEPSEEK_API_KEY` |
 | **Gemini Direct** | gemini-2.5-flash, gemini-2.5-pro, gemini-3.5-flash | `GEMINI_API_KEY` |
 | **OpenRouter** | Everything (Claude, GPT-4, Gemini, DeepSeek, …) | `OPENROUTER_API_KEY` |
+| **Claude Code CLI** | any id `claude --model` accepts, e.g. claude-sonnet-5-5, claude-opus-5-5, claude-haiku-5-5, claude-fable-5-2 | none: your Claude Code login |
 
 These are just the pre-configured ones. House tries direct APIs first (faster, cheaper), falls back to OpenRouter automatically (any model under the sun). DeepSeek models are the exception: they are routed to the DeepSeek API only, never through OpenRouter.
 
@@ -434,6 +435,36 @@ The provider registry lives in `everybody_lies/providers.py`. It's ~50 lines of 
 **Auto-detection** means you can set multiple keys and House picks the best model available. Claude Code users get Anthropic direct by default. CI pipelines might use DeepSeek for cost. Teammates might use OpenRouter. Same tool. Different keys. Same verdict.
 
 If all providers fail, House tells you exactly why — and it's probably your fault.
+
+### Claude Code provider (no API key)
+
+If you use Claude Code, House can run its model calls through the local CLI (`claude -p`). The prompt is piped on stdin, the model id is passed to `--model` exactly as you give it, and the CLI runs in an empty temp directory so no repository `CLAUDE.md` leaks into a review.
+
+- **Automatic:** with `claude` on your PATH and **no** API key set, House uses it (default model `claude-sonnet-5-5`). If any API key is set, nothing changes for you.
+- **Explicit:** set `model_config.provider` to `"claude-code"` (see [Repo-level overrides](#repo-level-overrides)) or `EVERYBODY_LIES_PROVIDER=claude-code`. Every model call then goes through the CLI, whatever the key situation.
+- If `claude` is not on PATH, House says so and blocks; it never pretends. One call times out after 240 s (`EVERYBODY_LIES_CLAUDE_TIMEOUT` to change).
+
+### Repo-level overrides
+
+Drop an optional `.house/chart.local.json` in your repo root. It is deep-merged over the packaged `chart.json` (objects merge key by key; lists of objects with an `id`, like `specialists`, merge by id). Add `.house/` to your `.git/info/exclude` to keep it private. It is read like a git hook: only keep it in repos you trust.
+
+```json
+{
+  "model_config": { "provider": "claude-code",
+                    "tier_defaults": { "preferred": "claude-sonnet-5-5", "budget": "claude-haiku-5-5" } },
+  "specialists": [ { "id": "cuddy", "model_overrides": { "preferred": "claude-opus-5-5" } } ],
+  "limits": { "max_rounds": 2, "daily_call_cap": 60 }
+}
+```
+
+### Safety limits (both off by default)
+
+| Setting (`limits.*`) | Env override | What it does |
+|---|---|---|
+| `max_rounds` | `EVERYBODY_LIES_MAX_ROUNDS` | Round 2 only checks whether round 1's findings were fixed and may add new **P1** findings only. When the last allowed round still fails, the verdict is **STUCK**: it blocks and says it needs a person. |
+| `daily_call_cap` | `EVERYBODY_LIES_DAILY_CALL_CAP` | Model calls per UTC day, counted in `stats.json`. When used up House stops before the next call and the verdict is **BLOCKED**. It never falls back to approving. |
+
+Set a value to turn it on; `0`, `off` or `null` turns it off. The environment variable wins over the chart, which is how you override a cap for one run: `EVERYBODY_LIES_DAILY_CALL_CAP=0 everybody-lies --staged`. STUCK and BLOCKED both exit 1. Tokens are not capped: House does not estimate them.
 
 ## Configuration
 
