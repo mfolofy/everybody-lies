@@ -656,13 +656,17 @@ def _match_file_pattern(file_path: str, pattern: str) -> bool:
     Supports **, *, and basic glob patterns.
     Handles the patterns in chart.json (mostly **/*.py, *.ts, etc.).
 
-    NOTE: Complex ** patterns with multiple intermediate directories
-    may not match correctly. The patterns in chart.json use ** as a
-    simple "match everything" prefix (e.g., **/*.py) which works fine.
-    If more complex patterns are needed, switch to pathlib.PurePosixPath.match()
-    once Python 3.13+ is the minimum (it supports ** natively).
+    Patterns containing ** are translated to a regular expression
+    (see _double_star_regex): "**/" matches zero or more whole directories,
+    a trailing "/**" matches everything below, and "*" and "?" stay inside
+    one path segment. Patterns without ** keep plain fnmatch behaviour.
+
+    Up to 0.3.1 the ** branch searched the text after "**/" as a literal
+    string, so "**/*.py" never matched any path (routing and patients.json
+    blocked_paths written that way silently matched nothing).
     """
     import fnmatch
+    import os
     # Normalize path separators
     import re as _re
     path = file_path.replace("\\", "/")
@@ -679,44 +683,44 @@ def _match_file_pattern(file_path: str, pattern: str) -> bool:
         return False
 
     # fnmatch supports * and ? but not **
-    # For ** patterns, we need to handle recursively
     if "**" in pat:
-        parts = pat.split("**")
-        pat_starts_starstar = pat.startswith("**")
-        pat_ends_starstar = pat.endswith("**")
-
-        # First part (prefix): must match start if pattern doesn't begin with **
-        if not pat_starts_starstar and parts[0]:
-            if not fnmatch.fnmatch(path, parts[0] + "*"):
-                return False
-
-        # Middle parts: must appear in the path in order
-        pos = 0
-        start_idx = 1 if pat_starts_starstar else 0
-        end_idx = len(parts) - 1 if pat_ends_starstar else len(parts)
-        for i in range(start_idx, end_idx):
-            if parts[i]:
-                seg = parts[i]
-                idx = path.find(seg, pos)
-                matched_len = len(seg)
-                if idx == -1:
-                    # Try without leading / (handles **/dir/** matching "dir/file")
-                    alt = seg.lstrip("/")
-                    if alt != seg:
-                        idx = path.find(alt, pos)
-                        matched_len = len(alt)
-                if idx == -1:
-                    return False
-                pos = idx + matched_len
-
-        # Last part (suffix): must match end if pattern doesn't end with **
-        if not pat_ends_starstar and len(parts) > 0 and parts[-1]:
-            if not path.endswith(parts[-1]) and not fnmatch.fnmatch(path, "*" + parts[-1]):
-                return False
-
-        return True
+        flags = _re.IGNORECASE if os.path.normcase("A") == "a" else 0
+        return _re.match(_double_star_regex(pat), path, flags) is not None
 
     return fnmatch.fnmatch(path, pat)
+
+
+def _double_star_regex(pat: str) -> str:
+    """Translate a glob that uses ** into an anchored regular expression."""
+    out = []
+    i, n = 0, len(pat)
+    while i < n:
+        if pat.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pat.startswith("/**", i) and i + 3 == n:
+            out.append("(?:/.*)?")
+            i += 3
+        elif pat.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pat[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pat[i] == "?":
+            out.append("[^/]")
+            i += 1
+        elif pat[i] == "[" and "]" in pat[i + 2:]:
+            j = pat.index("]", i + 2)
+            body = pat[i + 1:j]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("[" + body.replace("\\", "\\\\") + "]")
+            i = j + 1
+        else:
+            out.append(re.escape(pat[i]))
+            i += 1
+    return r"\A" + "".join(out) + r"\Z"
 
 
 def format_scan_result(result: ScanResult, for_ci: bool = False) -> str:
