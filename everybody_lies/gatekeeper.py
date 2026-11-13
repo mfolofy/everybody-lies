@@ -336,6 +336,32 @@ def _git_rev_list_objects(old_sha: str, new_sha: str) -> list[str]:
     return paths
 
 
+def _git_changed_paths(old_sha: str, new_sha: str) -> list[str]:
+    """Return every path added or modified by the commits in the push range.
+
+    Complements _git_rev_list_objects, which lists only objects new to the
+    repo: a blocked path whose blob already exists (an empty file, a copy, a
+    rename) introduces no new blob and would otherwise pass unseen. Same range
+    rules as _git_rev_list_objects. Deletions are not listed.
+    """
+    if old_sha == _NULL_SHA or not old_sha:
+        base = _new_branch_base(new_sha)
+        rng = [f"{base}..{new_sha}"] if base else ["-1", new_sha]
+    else:
+        rng = [f"{old_sha}..{new_sha}"]
+    cmd = ["git", "-c", "core.quotepath=false", "log", "--format=", "--name-only",
+           "--no-renames", "--diff-filter=d", "-m", *rng]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"git log failed: {result.stderr.strip()}")
+    seen: list[str] = []
+    for line in result.stdout.splitlines():
+        p = line.strip()
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
 def _check_paths_against_scope(files: list[str], remote_config: dict) -> list[str]:
     """Return list of violation strings for files that violate remote_config scope.
 
@@ -418,6 +444,9 @@ def run_pre_push_check(remote_name: str, refs: list[dict]) -> dict:
         try:
             objects = _git_rev_list_objects(old_sha, new_sha)
             files.extend(objects)
+            # Objects alone miss a path whose content already exists in the
+            # repo (empty file, copy, rename): check every path the commits touch.
+            files.extend(p for p in _git_changed_paths(old_sha, new_sha) if p not in files)
         except Exception as exc:
             return {"verdict": "REJECTED",
                     "reason": f"git rev-list failed: {exc}",
